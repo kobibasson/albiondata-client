@@ -89,11 +89,17 @@ func decodeEvent(params map[uint8]interface{}) (event operation, err error) {
 
 	eventType := params[252].(int16)
 
-	switch eventType {
+	switch EventType(eventType) {
 	// case evRespawn: //TODO: confirm this eventCode (old 77)
 	// 	event = &eventPlayerOnlineStatus{}
 	// case evCharacterStats: //TODO: confirm this eventCode (old 114)
 	// 	event = &eventSkillData{}
+	case evNewSimpleItem:
+		event = &eventNewSimpleItem{}
+	case evInventoryPutItem:
+		event = &eventInventoryPutItem{}
+	case evInventoryDeleteItem:
+		event = &eventInventoryDeleteItem{}
 	default:
 		return nil, nil
 	}

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/ao-data/albiondata-client/log"
@@ -30,6 +31,27 @@ func (apw *albionProcessWatcher) run() error {
 	}
 	apw.devices = physicalInterfaces
 	log.Debugf("Will listen to these devices: %v", apw.devices)
+	
+	// Initialize inventory tracker if output path or webhook URL is provided
+	if ConfigGlobal.InventoryOutputPath != "" || ConfigGlobal.InventoryWebhookURL != "" {
+		fmt.Println("=================================================")
+		
+		// Initialize with output path if provided
+		if ConfigGlobal.InventoryOutputPath != "" {
+			fmt.Printf("INVENTORY TRACKING ENABLED: %s\n", ConfigGlobal.InventoryOutputPath)
+			fmt.Println("Inventory changes will be displayed in real-time")
+		}
+		
+		// Initialize with webhook if provided
+		if ConfigGlobal.InventoryWebhookURL != "" {
+			fmt.Printf("WEBHOOK ENABLED: Sending updates to %s\n", ConfigGlobal.InventoryWebhookURL)
+			fmt.Println("Webhook debug information will be displayed in real-time")
+		}
+		
+		fmt.Println("=================================================")
+		apw.r.albionstate.Inventory = NewPlayerInventory(ConfigGlobal.InventoryOutputPath, ConfigGlobal.InventoryWebhookURL)
+	}
+	
 	go apw.r.run()
 
 	for {

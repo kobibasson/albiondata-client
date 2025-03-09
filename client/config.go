@@ -38,6 +38,8 @@ type config struct {
 	PublicIngestBaseUrls           string
 	NoCPULimit                     bool
 	PrintVersion                   bool
+	InventoryOutputPath            string
+	InventoryWebhookURL            string
 }
 
 // config global config data
@@ -153,6 +155,20 @@ func (config *config) setupDebugFlags() {
 }
 
 func (config *config) setupCommonFlags() {
+	flag.StringVar(
+		&config.PublicIngestBaseUrls,
+		"i",
+		"http+pow://albion-online-data.com",
+		"Base URL to send PUBLIC data to, can be 'nats://', 'http://' or 'noop' and can have multiple uploaders. Comma separated.",
+	)
+
+	flag.StringVar(
+		&config.PrivateIngestBaseUrls,
+		"p",
+		"",
+		"Base URL to send PRIVATE data to, can be 'nats://', 'http://' or 'noop' and can have multiple uploaders. Comma separated.",
+	)
+
 	flag.BoolVar(
 		&config.DisableUpload,
 		"d",
@@ -181,6 +197,13 @@ func (config *config) setupCommonFlags() {
 		"Parses a local file instead of checking albion ports.",
 	)
 
+	flag.StringVar(
+		&config.RecordPath,
+		"record",
+		"",
+		"Enable recording commands to a file for debugging later.",
+	)
+
 	flag.BoolVar(
 		&config.Minimize,
 		"minimize",
@@ -189,24 +212,17 @@ func (config *config) setupCommonFlags() {
 	)
 
 	flag.StringVar(
-		&config.PublicIngestBaseUrls,
-		"i",
-		"http+pow://albion-online-data.com",
-		"Base URL to send PUBLIC data to, can be 'nats://', 'http://' or 'noop' and can have multiple uploaders. Comma separated.",
+		&config.InventoryOutputPath,
+		"inventory-output",
+		"",
+		"Path to save the player's inventory as a JSON file.",
 	)
 
 	flag.StringVar(
-		&config.PrivateIngestBaseUrls,
-		"p",
+		&config.InventoryWebhookURL,
+		"inventory-webhook",
 		"",
-		"Base URL to send PRIVATE data to, can be 'nats://', 'http://' or 'noop' and can have multiple uploaders. Comma separated.",
-	)
-
-	flag.StringVar(
-		&config.RecordPath,
-		"record",
-		"",
-		"Enable recording commands to a file for debugging later.",
+		"URL to send inventory updates to (e.g., http://localhost:3000/api/inventory/webhook).",
 	)
 }
 

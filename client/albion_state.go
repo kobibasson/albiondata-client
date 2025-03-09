@@ -26,6 +26,7 @@ type albionState struct {
 	AODataServerID       int
 	AODataIngestBaseURL  string
 	WaitingForMarketData bool
+	Inventory            *PlayerInventory
 
 	// A lot of information is sent out but not contained in the response when requesting marketHistory (e.g. ID)
 	// This information is stored in marketHistoryInfo
@@ -51,6 +52,17 @@ func (state albionState) IsValidLocation() bool {
 		return false
 	}
 	return true
+}
+
+// UpdateInventoryCharacterInfo updates the character information in the inventory tracker
+func (state *albionState) UpdateInventoryCharacterInfo() {
+	if state.Inventory == nil {
+		return
+	}
+
+	if state.CharacterId != "" && state.CharacterName != "" {
+		state.Inventory.UpdateCharacterInfo(string(state.CharacterId), state.CharacterName)
+	}
 }
 
 func (state albionState) GetServer() (int, string) {

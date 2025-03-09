@@ -54,4 +54,7 @@ func (op operationJoinResponse) Process(state *albionState) {
 		log.Infof("Updating player to %v.", op.CharacterName)
 	}
 	state.CharacterName = op.CharacterName
+	
+	// Update character information in the inventory tracker
+	state.UpdateInventoryCharacterInfo()
 }
