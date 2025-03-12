@@ -18,7 +18,26 @@ import (
 type InventoryItem struct {
 	ItemID   int   `json:"item_id"`
 	Quantity int   `json:"quantity"`
+	SlotID   int   `json:"slot_id"`    // Added SlotID field
 	LastSeen int64 `json:"last_seen"`
+}
+
+// WebhookEvent represents a single inventory event to be sent to the webhook
+type WebhookEvent struct {
+	ItemID        int    `json:"item_id"`
+	Quantity      int    `json:"quantity"`
+	SlotID        int    `json:"slot_id"`
+	Delta         int    `json:"delta"`
+	Action        string `json:"action"`
+	Timestamp     int64  `json:"timestamp"`
+}
+
+// WebhookPayload represents the data sent to the webhook
+type WebhookPayload struct {
+	Events        []WebhookEvent `json:"events"`
+	CharacterID   string         `json:"character_id"`
+	CharacterName string         `json:"character_name"`
+	BatchTimestamp int64         `json:"batch_timestamp"`
 }
 
 // PlayerInventory represents the player's inventory
@@ -33,16 +52,31 @@ type PlayerInventory struct {
 	verboseOutput bool
 	// Webhook URL to send inventory updates
 	webhookURL    string
+	// Queue for pending webhook events
+	pendingEvents []WebhookEvent
+	// Timer for sending batched events
+	batchTimer    *time.Timer
+	// Mutex for the pending events queue
+	eventMutex    sync.Mutex
 }
 
 // NewPlayerInventory creates a new player inventory tracker
 func NewPlayerInventory(outputPath string, webhookURL string) *PlayerInventory {
-	return &PlayerInventory{
+	pi := &PlayerInventory{
 		Items:         make(map[int]*InventoryItem),
 		outputPath:    outputPath,
 		verboseOutput: true, // Enable verbose output by default when inventory tracking is enabled
 		webhookURL:    webhookURL,
+		pendingEvents: make([]WebhookEvent, 0),
 	}
+	
+	// Initialize the batch timer but don't start it yet
+	pi.batchTimer = time.AfterFunc(3*time.Second, func() {
+		pi.sendBatchedEvents()
+	})
+	pi.batchTimer.Stop() // Don't start the timer until we have events
+	
+	return pi
 }
 
 // UpdateCharacterInfo updates the character information
@@ -56,38 +90,84 @@ func (pi *PlayerInventory) UpdateCharacterInfo(characterID, characterName string
 	if pi.verboseOutput {
 		fmt.Printf("[Inventory] Character info updated: %s (%s)\n", characterName, characterID)
 	}
-	
-	// We don't need to send character info via webhook anymore since we're only tracking item changes
 }
 
-// WebhookPayload represents the data sent to the webhook
-type WebhookPayload struct {
-	ItemID    int   `json:"item_id"`
-	Quantity  int   `json:"quantity"`
-	Timestamp int64 `json:"timestamp"`
-}
-
-// sendWebhookUpdate sends an update to the configured webhook URL
-func (pi *PlayerInventory) sendWebhookUpdate(action string, itemID int, quantity int, oldQuantity int) {
+// queueWebhookEvent adds an event to the pending events queue and resets the timer
+func (pi *PlayerInventory) queueWebhookEvent(action string, itemID int, quantity int, oldQuantity int, slotID int) {
 	if pi.webhookURL == "" {
 		return
 	}
 
-	payload := WebhookPayload{
+	// Calculate the delta (change in quantity)
+	delta := quantity - oldQuantity
+
+	event := WebhookEvent{
 		ItemID:    itemID,
 		Quantity:  quantity,
+		SlotID:    slotID,
+		Delta:     delta,
+		Action:    action,
 		Timestamp: time.Now().Unix(),
 	}
 
+	// Format delta with a sign for better visibility in logs
+	var deltaStr string
+	if delta > 0 {
+		deltaStr = fmt.Sprintf("+%d", delta)
+	} else {
+		deltaStr = fmt.Sprintf("%d", delta)
+	}
+
+	// Always print webhook debug info
+	fmt.Printf("[Webhook] Queuing: %s for item %d (Qty: %d, Delta: %s)\n", 
+		action, itemID, quantity, deltaStr)
+
+	// Add the event to the queue
+	pi.eventMutex.Lock()
+	defer pi.eventMutex.Unlock()
+	
+	pi.pendingEvents = append(pi.pendingEvents, event)
+	
+	// Reset the timer to 3 seconds
+	pi.batchTimer.Reset(3 * time.Second)
+	
+	fmt.Printf("[Webhook] Batch size: %d events (waiting 3s for more events)\n", len(pi.pendingEvents))
+}
+
+// sendBatchedEvents sends all pending events in a single webhook request
+func (pi *PlayerInventory) sendBatchedEvents() {
+	pi.eventMutex.Lock()
+	defer pi.eventMutex.Unlock()
+	
+	// If there are no events, do nothing
+	if len(pi.pendingEvents) == 0 {
+		return
+	}
+	
+	fmt.Printf("[Webhook] Sending batch of %d events\n", len(pi.pendingEvents))
+	
+	// Create the payload
+	payload := WebhookPayload{
+		Events:        pi.pendingEvents,
+		CharacterID:   pi.CharacterID,
+		CharacterName: pi.CharacterName,
+		BatchTimestamp: time.Now().Unix(),
+	}
+	
+	// Marshal the payload
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
 		log.Errorf("Failed to marshal webhook payload: %v", err)
 		return
 	}
-
-	// Always print webhook debug info
-	fmt.Printf("[Webhook] Sending: %s for item %d (Qty: %d)\n", 
-		action, itemID, quantity)
+	
+	// Print the full JSON payload with nice formatting
+	prettyJSON, err := json.MarshalIndent(payload, "", "  ")
+	if err == nil {
+		fmt.Printf("[Webhook] Payload:\n%s\n", string(prettyJSON))
+	} else {
+		fmt.Printf("[Webhook] Payload: %s\n", string(jsonPayload))
+	}
 	
 	// Send the payload to the webhook URL
 	resp, err := http.Post(pi.webhookURL, "application/json", bytes.NewBuffer(jsonPayload))
@@ -97,7 +177,7 @@ func (pi *PlayerInventory) sendWebhookUpdate(action string, itemID int, quantity
 		return
 	}
 	defer resp.Body.Close()
-
+	
 	if resp.StatusCode >= 400 {
 		log.Errorf("Webhook returned error status: %d", resp.StatusCode)
 		fmt.Printf("[Webhook] ERROR: Server returned status code %d\n", resp.StatusCode)
@@ -110,10 +190,13 @@ func (pi *PlayerInventory) sendWebhookUpdate(action string, itemID int, quantity
 			fmt.Printf("[Webhook] Response: %s\n", string(respBody))
 		}
 	}
+	
+	// Clear the pending events
+	pi.pendingEvents = make([]WebhookEvent, 0)
 }
 
 // AddOrUpdateItem adds or updates an item in the inventory
-func (pi *PlayerInventory) AddOrUpdateItem(itemID int, quantity int) {
+func (pi *PlayerInventory) AddOrUpdateItem(itemID int, quantity int, slotID int) {
 	pi.mutex.Lock()
 	defer pi.mutex.Unlock()
 
@@ -142,6 +225,7 @@ func (pi *PlayerInventory) AddOrUpdateItem(itemID int, quantity int) {
 		oldQuantity = item.Quantity
 		action = "Updated"
 		item.Quantity = quantity
+		item.SlotID = slotID
 		item.LastSeen = now
 	} else {
 		oldQuantity = 0
@@ -149,6 +233,7 @@ func (pi *PlayerInventory) AddOrUpdateItem(itemID int, quantity int) {
 		pi.Items[itemID] = &InventoryItem{
 			ItemID:   itemID,
 			Quantity: quantity,
+			SlotID:   slotID,
 			LastSeen: now,
 		}
 	}
@@ -158,29 +243,36 @@ func (pi *PlayerInventory) AddOrUpdateItem(itemID int, quantity int) {
 	// Print inventory change message even without debug flags
 	if pi.verboseOutput {
 		var changeMsg string
-		if action == "Added" {
-			changeMsg = fmt.Sprintf("[Inventory] %s item: ID=%d, Quantity=%d", action, itemID, quantity)
+		diff := quantity - oldQuantity
+		
+		// Format delta with a sign for better visibility
+		var deltaStr string
+		if diff > 0 {
+			deltaStr = fmt.Sprintf("+%d", diff)
+		} else if diff < 0 {
+			deltaStr = fmt.Sprintf("%d", diff)
 		} else {
-			diff := quantity - oldQuantity
-			if diff > 0 {
-				changeMsg = fmt.Sprintf("[Inventory] %s item: ID=%d, Quantity=%d (+%d)", action, itemID, quantity, diff)
-			} else if diff < 0 {
-				changeMsg = fmt.Sprintf("[Inventory] %s item: ID=%d, Quantity=%d (%d)", action, itemID, quantity, diff)
-			} else {
-				changeMsg = fmt.Sprintf("[Inventory] %s item: ID=%d, Quantity=%d (no change)", action, itemID, quantity)
-			}
+			deltaStr = "±0"
+		}
+		
+		if action == "Added" {
+			changeMsg = fmt.Sprintf("[Inventory] %s item: ID=%d, Quantity=%d, SlotID=%d (Delta: %s)", 
+				action, itemID, quantity, slotID, deltaStr)
+		} else {
+			changeMsg = fmt.Sprintf("[Inventory] %s item: ID=%d, Quantity=%d, SlotID=%d (Delta: %s)", 
+				action, itemID, quantity, slotID, deltaStr)
 		}
 		fmt.Println(changeMsg)
 	}
 	
-	// Send webhook update
+	// Queue webhook update
 	if pi.webhookURL != "" {
 		// For webhook, we'll send the corrected quantity but include the original in the debug message
 		if originalQuantity < 0 && quantity != originalQuantity {
 			fmt.Printf("[Webhook] Note: Converting negative quantity %d to %d for item %d\n", 
 				originalQuantity, quantity, itemID)
 		}
-		pi.sendWebhookUpdate(action, itemID, quantity, oldQuantity)
+		pi.queueWebhookEvent(action, itemID, quantity, oldQuantity, slotID)
 	}
 	
 	// Only save to file if an output path is provided
@@ -197,13 +289,16 @@ func (pi *PlayerInventory) RemoveItem(itemID int) {
 	var oldQuantity int
 	if item, exists := pi.Items[itemID]; exists {
 		if pi.verboseOutput {
-			fmt.Printf("[Inventory] Removed item: ID=%d, Quantity was %d\n", itemID, item.Quantity)
+			// Calculate delta (always negative for removals)
+			delta := -item.Quantity
+			fmt.Printf("[Inventory] Removed item: ID=%d, Quantity was %d (Delta: %d)\n", 
+				itemID, item.Quantity, delta)
 		}
 		oldQuantity = item.Quantity
 		
-		// Send webhook update
+		// Queue webhook update
 		if pi.webhookURL != "" {
-			pi.sendWebhookUpdate("Removed", itemID, 0, oldQuantity)
+			pi.queueWebhookEvent("Removed", itemID, 0, oldQuantity, item.SlotID)
 		}
 	}
 

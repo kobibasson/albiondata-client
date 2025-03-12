@@ -6,6 +6,7 @@ import (
 
 // eventInventoryDeleteItem contains data for the evInventoryDeleteItem event
 type eventInventoryDeleteItem struct {
+	SlotID int `mapstructure:"0"`
 	ItemID int `mapstructure:"1"`
 }
 
@@ -16,6 +17,6 @@ func (e *eventInventoryDeleteItem) Process(state *albionState) {
 		return
 	}
 
-	log.Debugf("Processing evInventoryDeleteItem: ItemID=%d", e.ItemID)
+	log.Debugf("Processing evInventoryDeleteItem: ItemID=%d, SlotID=%d", e.ItemID, e.SlotID)
 	state.Inventory.RemoveItem(e.ItemID)
 } 

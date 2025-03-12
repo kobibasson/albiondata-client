@@ -6,8 +6,10 @@ import (
 
 // eventNewSimpleItem contains data for the evNewSimpleItem event
 type eventNewSimpleItem struct {
+	SlotID   int `mapstructure:"0"`
 	ItemID   int `mapstructure:"1"`
 	Quantity int `mapstructure:"2"`
+	// ContainerID int `mapstructure:"4"` // Optional: Add ContainerID field if needed
 }
 
 // Process handles the evNewSimpleItem event
@@ -18,10 +20,10 @@ func (e *eventNewSimpleItem) Process(state *albionState) {
 	}
 
 	if e.Quantity < 0 {
-		log.Debugf("Processing evNewSimpleItem with negative quantity: ItemID=%d, Quantity=%d", e.ItemID, e.Quantity)
+		log.Debugf("Processing evNewSimpleItem with negative quantity: ItemID=%d, Quantity=%d, SlotID=%d", e.ItemID, e.Quantity, e.SlotID)
 	} else {
-		log.Debugf("Processing evNewSimpleItem: ItemID=%d, Quantity=%d", e.ItemID, e.Quantity)
+		log.Debugf("Processing evNewSimpleItem: ItemID=%d, Quantity=%d, SlotID=%d", e.ItemID, e.Quantity, e.SlotID)
 	}
 	
-	state.Inventory.AddOrUpdateItem(e.ItemID, e.Quantity)
+	state.Inventory.AddOrUpdateItem(e.ItemID, e.Quantity, e.SlotID)
 } 

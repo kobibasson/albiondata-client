@@ -6,6 +6,7 @@ import (
 
 // eventInventoryPutItem contains data for the evInventoryPutItem event
 type eventInventoryPutItem struct {
+	SlotID   int `mapstructure:"0"`
 	ItemID   int `mapstructure:"1"`
 	Quantity int `mapstructure:"2"`
 }
@@ -18,10 +19,10 @@ func (e *eventInventoryPutItem) Process(state *albionState) {
 	}
 
 	if e.Quantity < 0 {
-		log.Debugf("Processing evInventoryPutItem with negative quantity: ItemID=%d, Quantity=%d", e.ItemID, e.Quantity)
+		log.Debugf("Processing evInventoryPutItem with negative quantity: ItemID=%d, Quantity=%d, SlotID=%d", e.ItemID, e.Quantity, e.SlotID)
 	} else {
-		log.Debugf("Processing evInventoryPutItem: ItemID=%d, Quantity=%d", e.ItemID, e.Quantity)
+		log.Debugf("Processing evInventoryPutItem: ItemID=%d, Quantity=%d, SlotID=%d", e.ItemID, e.Quantity, e.SlotID)
 	}
 	
-	state.Inventory.AddOrUpdateItem(e.ItemID, e.Quantity)
+	state.Inventory.AddOrUpdateItem(e.ItemID, e.Quantity, e.SlotID)
 } 
