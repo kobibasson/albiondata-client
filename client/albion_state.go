@@ -27,6 +27,9 @@ type albionState struct {
 	AODataIngestBaseURL  string
 	WaitingForMarketData bool
 	Inventory            *PlayerInventory
+	LastClusterChangeTime int64 // Timestamp of the last cluster change
+	LastJoinTime         int64 // Timestamp of the last join operation
+	LastLeaveTime        int64 // Timestamp of the last leave event
 
 	// A lot of information is sent out but not contained in the response when requesting marketHistory (e.g. ID)
 	// This information is stored in marketHistoryInfo

@@ -3,22 +3,38 @@ package client
 import (
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ao-data/albiondata-client/lib"
 	"github.com/ao-data/albiondata-client/log"
 )
 
+// operationJoin contains data for the opJoin operation
+type operationJoin struct {
+	// Add fields if needed based on the actual data structure
+}
+
+// Process handles the opJoin operation
+func (op operationJoin) Process(state *albionState) {
+	log.Debug("Got Join operation...")
+	
+	// Update the last join time in the state
+	state.LastJoinTime = time.Now().Unix()
+	
+	if state.Inventory != nil {
+		log.Debug("Notifying inventory tracker of join operation...")
+		state.Inventory.OnJoin()
+	}
+}
+
+// operationJoinResponse contains data for the opJoin response
 type operationJoinResponse struct {
 	CharacterID   lib.CharacterID `mapstructure:"1"`
 	CharacterName string          `mapstructure:"2"`
-	Location      string          `mapstructure:"8"`
-	GuildID       lib.CharacterID `mapstructure:"53"`
-	GuildName     string          `mapstructure:"57"`
+	Location      string          `mapstructure:"7"`
 }
 
-//CharacterPartsJSON string          `mapstructure:"6"`
-//Edition            string          `mapstructure:"38"`
-
+// Process handles the opJoin response
 func (op operationJoinResponse) Process(state *albionState) {
 	log.Debugf("Got JoinResponse operation...")
 
@@ -57,4 +73,12 @@ func (op operationJoinResponse) Process(state *albionState) {
 	
 	// Update character information in the inventory tracker
 	state.UpdateInventoryCharacterInfo()
+	
+	// Also update the last join time in the state
+	state.LastJoinTime = time.Now().Unix()
+	
+	if state.Inventory != nil {
+		log.Debug("Notifying inventory tracker of join operation from response...")
+		state.Inventory.OnJoin()
+	}
 }

@@ -38,6 +38,7 @@ type WebhookPayload struct {
 	CharacterID   string         `json:"character_id"`
 	CharacterName string         `json:"character_name"`
 	BatchTimestamp int64         `json:"batch_timestamp"`
+	Override      bool           `json:"override"`      // Flag to indicate if this batch should override previous data
 }
 
 // PlayerInventory represents the player's inventory
@@ -58,6 +59,12 @@ type PlayerInventory struct {
 	batchTimer    *time.Timer
 	// Mutex for the pending events queue
 	eventMutex    sync.Mutex
+	// Timestamp of the last cluster change
+	lastClusterChangeTime int64
+	// Timestamp of the last join operation
+	lastJoinTime int64
+	// Timestamp of the last leave event
+	lastLeaveTime int64
 }
 
 // NewPlayerInventory creates a new player inventory tracker
@@ -77,6 +84,33 @@ func NewPlayerInventory(outputPath string, webhookURL string) *PlayerInventory {
 	pi.batchTimer.Stop() // Don't start the timer until we have events
 	
 	return pi
+}
+
+// OnClusterChange is called when a cluster change operation is detected
+func (pi *PlayerInventory) OnClusterChange() {
+	pi.eventMutex.Lock()
+	defer pi.eventMutex.Unlock()
+	
+	pi.lastClusterChangeTime = time.Now().Unix()
+	log.Debugf("Inventory tracker notified of cluster change at timestamp %d", pi.lastClusterChangeTime)
+}
+
+// OnJoin is called when a join operation is detected
+func (pi *PlayerInventory) OnJoin() {
+	pi.eventMutex.Lock()
+	defer pi.eventMutex.Unlock()
+	
+	pi.lastJoinTime = time.Now().Unix()
+	log.Debugf("Inventory tracker notified of join operation at timestamp %d", pi.lastJoinTime)
+}
+
+// OnLeave is called when a leave event is detected
+func (pi *PlayerInventory) OnLeave() {
+	pi.eventMutex.Lock()
+	defer pi.eventMutex.Unlock()
+	
+	pi.lastLeaveTime = time.Now().Unix()
+	log.Debugf("Inventory tracker notified of leave event at timestamp %d", pi.lastLeaveTime)
 }
 
 // UpdateCharacterInfo updates the character information
@@ -146,12 +180,38 @@ func (pi *PlayerInventory) sendBatchedEvents() {
 	
 	fmt.Printf("[Webhook] Sending batch of %d events\n", len(pi.pendingEvents))
 	
+	// Check if any events occurred within 3 seconds after a cluster change, join operation, or leave event
+	now := time.Now().Unix()
+	override := false
+	
+	// Check for cluster change
+	if pi.lastClusterChangeTime > 0 && now - pi.lastClusterChangeTime <= 3 {
+		override = true
+		fmt.Printf("[Webhook] Setting override flag to true (cluster change was %d seconds ago)\n", 
+			now - pi.lastClusterChangeTime)
+	}
+	
+	// Check for join operation
+	if pi.lastJoinTime > 0 && now - pi.lastJoinTime <= 3 {
+		override = true
+		fmt.Printf("[Webhook] Setting override flag to true (join operation was %d seconds ago)\n", 
+			now - pi.lastJoinTime)
+	}
+	
+	// Check for leave event
+	if pi.lastLeaveTime > 0 && now - pi.lastLeaveTime <= 3 {
+		override = true
+		fmt.Printf("[Webhook] Setting override flag to true (leave event was %d seconds ago)\n", 
+			now - pi.lastLeaveTime)
+	}
+	
 	// Create the payload
 	payload := WebhookPayload{
 		Events:        pi.pendingEvents,
 		CharacterID:   pi.CharacterID,
 		CharacterName: pi.CharacterName,
-		BatchTimestamp: time.Now().Unix(),
+		BatchTimestamp: now,
+		Override:      override,
 	}
 	
 	// Marshal the payload

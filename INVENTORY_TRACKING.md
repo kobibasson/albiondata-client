@@ -61,11 +61,15 @@ Example messages:
 When using the `-inventory-webhook` flag, you'll see detailed debug information about the webhook requests and responses:
 
 ```
-[Webhook] Sending: Added for item 909 (Qty: 122, Old: 0)
+[Webhook] Queuing: Added for item 909 (Qty: 122, Delta: +122)
+[Webhook] Batch size: 1 events (waiting 3s for more events)
+[Webhook] Sending batch of 1 events
 [Webhook] SUCCESS: Server responded with status code 200
 [Webhook] Response: {"success":true}
 
-[Webhook] Sending: Updated for item 912 (Qty: 946, Old: 941)
+[Webhook] Queuing: Updated for item 912 (Qty: 946, Delta: +5)
+[Webhook] Batch size: 1 events (waiting 3s for more events)
+[Webhook] Sending batch of 1 events
 [Webhook] SUCCESS: Server responded with status code 200
 [Webhook] Response: {"success":true}
 ```
@@ -73,7 +77,9 @@ When using the `-inventory-webhook` flag, you'll see detailed debug information 
 If there are any errors, you'll see detailed error messages:
 
 ```
-[Webhook] Sending: Updated for item 912 (Qty: 946, Old: 941)
+[Webhook] Queuing: Updated for item 912 (Qty: 946, Delta: +5)
+[Webhook] Batch size: 1 events (waiting 3s for more events)
+[Webhook] Sending batch of 1 events
 [Webhook] ERROR: Failed to send webhook: dial tcp [::1]:3000: connectex: No connection could be made because the target machine actively refused it.
 ```
 
@@ -85,15 +91,37 @@ The webhook feature sends a JSON payload to the specified URL whenever your inve
 
 ```json
 {
-  "action": "Added",  // or "Updated", "Removed", "CharacterInfo"
-  "item_id": 909,
-  "quantity": 122,
-  "old_quantity": 0,
+  "events": [
+    {
+      "item_id": 909,
+      "quantity": 122,
+      "slot_id": 0,
+      "delta": 122,
+      "action": "Added",
+      "timestamp": 1709971612
+    },
+    {
+      "item_id": 912,
+      "quantity": 946,
+      "slot_id": 1,
+      "delta": 5,
+      "action": "Updated",
+      "timestamp": 1709971615
+    }
+  ],
   "character_id": "your-character-uuid",
   "character_name": "YourCharacterName",
-  "timestamp": 1709971612
+  "batch_timestamp": 1709971618,
+  "override": false
 }
 ```
+
+The `override` flag is set to `true` when any of the following events occur within 3 seconds of the batch:
+- Player joins a new zone (`opJoin`)
+- Player leaves a zone (detected via `evUpdateChatSettings`)
+- Player changes clusters (`opChangeCluster`)
+
+This flag can be used by your webhook handler to determine if it should override previous inventory data, which is useful when the player is transitioning between zones or logging out.
 
 You can use this webhook to integrate with other applications, such as:
 - A custom web dashboard to monitor your inventory
@@ -113,11 +141,13 @@ The inventory JSON file will have the following format:
     "909": {
       "item_id": 909,
       "quantity": 122,
+      "slot_id": 0,
       "last_seen": 1709971612
     },
     "912": {
       "item_id": 912,
       "quantity": 911,
+      "slot_id": 1,
       "last_seen": 1709971678
     }
   },
@@ -130,6 +160,7 @@ The inventory JSON file will have the following format:
 - `items`: A map of items in your inventory, where the key is the item ID
   - `item_id`: The ID of the item
   - `quantity`: The quantity of the item
+  - `slot_id`: The slot ID of the item in your inventory
   - `last_seen`: The timestamp when the item was last seen (Unix timestamp)
 - `last_updated`: The timestamp when the inventory was last updated (Unix timestamp)
 

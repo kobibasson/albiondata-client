@@ -20,6 +20,8 @@ func decodeRequest(params map[uint8]interface{}) (operation operation, err error
 	switch OperationType(code) {
 	case opGetGameServerByCluster:
 		operation = &operationGetGameServerByCluster{}
+	case opJoin:
+		operation = &operationJoin{}
 	case opAuctionGetOffers:
 		operation = &operationAuctionGetOffers{}
 	case opAuctionGetItemAverageStats:
@@ -33,6 +35,8 @@ func decodeRequest(params map[uint8]interface{}) (operation operation, err error
 		operation = &operationRealEstateGetAuctionData{}
 	case opRealEstateBidOnAuction:
 		operation = &operationRealEstateBidOnAuction{}
+	case opChangeCluster:
+		operation = &operationChangeCluster{}
 	default:
 		return nil, nil
 	}
@@ -90,6 +94,8 @@ func decodeEvent(params map[uint8]interface{}) (event operation, err error) {
 	eventType := params[252].(int16)
 
 	switch EventType(eventType) {
+	case evUpdateChatSettings:
+		event = &eventUpdateChatSettings{}
 	// case evRespawn: //TODO: confirm this eventCode (old 77)
 	// 	event = &eventPlayerOnlineStatus{}
 	// case evCharacterStats: //TODO: confirm this eventCode (old 114)
