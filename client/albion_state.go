@@ -30,6 +30,8 @@ type albionState struct {
 	LastClusterChangeTime int64 // Timestamp of the last cluster change
 	LastJoinTime         int64 // Timestamp of the last join operation
 	LastLeaveTime        int64 // Timestamp of the last leave event
+	LastBankVaultLocationID string // ID of the last bank vault accessed
+	LastBankVaultTime    int64 // Timestamp of the last bank vault access
 
 	// A lot of information is sent out but not contained in the response when requesting marketHistory (e.g. ID)
 	// This information is stored in marketHistoryInfo

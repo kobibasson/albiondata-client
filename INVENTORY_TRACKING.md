@@ -89,6 +89,8 @@ This makes it easy to debug webhook integration issues without having to enable 
 
 The webhook feature sends a JSON payload to the specified URL whenever your inventory changes. The payload includes:
 
+### Example without bank access:
+
 ```json
 {
   "events": [
@@ -112,7 +114,31 @@ The webhook feature sends a JSON payload to the specified URL whenever your inve
   "character_id": "your-character-uuid",
   "character_name": "YourCharacterName",
   "batch_timestamp": 1709971618,
-  "override": false
+  "override": false,
+  "bank": false
+}
+```
+
+### Example with bank access:
+
+```json
+{
+  "events": [
+    {
+      "item_id": 909,
+      "quantity": 122,
+      "slot_id": 0,
+      "delta": 122,
+      "action": "Added",
+      "timestamp": 1709971612
+    }
+  ],
+  "character_id": "your-character-uuid",
+  "character_name": "YourCharacterName",
+  "batch_timestamp": 1709971618,
+  "override": false,
+  "bank": true,
+  "location_id": "7925feb4-f097-4d32-a025-4e65082a3992"
 }
 ```
 
@@ -120,6 +146,12 @@ The `override` flag is set to `true` when any of the following events occur with
 - Player joins a new zone (`opJoin`)
 - Player leaves a zone (detected via `evUpdateChatSettings`)
 - Player changes clusters (`opChangeCluster`)
+
+The `bank` flag is always included in the payload and defaults to `false`. It is set to `true` when the batch is related to a bank vault access (within 3 seconds before or after). When `bank` is `true`, the `location_id` field is also included, containing the UUID of the bank vault, which can be used to identify the city. For example:
+- `7925feb4-f097-4d32-a025-4e65082a3992` is the Thetford bank vault
+- `f56a368d-2f0b-4d01-a1ba-0079cf8b1fa9` is the Fort Sterling bank vault
+
+Note that the location ID is just the UUID part, without the `@` sign and any additional information that follows it in the original game data.
 
 This flag can be used by your webhook handler to determine if it should override previous inventory data, which is useful when the player is transitioning between zones or logging out.
 
@@ -169,8 +201,8 @@ The inventory JSON file will have the following format:
 The inventory tracking feature works by monitoring the following game events:
 
 1. `evNewSimpleItem`: When you gather or receive new items
-2. `evInventoryPutItem`: When items are added to your inventory
-3. `evInventoryDeleteItem`: When items are removed from your inventory
+2. `evNewEquipmentItem`: When you receive equipment items
+3. `evBankVaultInfo`: When you access a bank vault
 
 When any of these events occur, the inventory tracker updates the JSON file (if enabled) and sends a webhook update (if enabled).
 
