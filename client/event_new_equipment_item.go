@@ -8,9 +8,10 @@ import (
 
 // eventNewEquipmentItem contains data for the evNewEquipmentItem event
 type eventNewEquipmentItem struct {
-	SlotID   int `mapstructure:"0"`
-	ItemID   int `mapstructure:"1"`
-	Quantity int `mapstructure:"2"`
+	SlotID   int  `mapstructure:"0"`
+	ItemID   int  `mapstructure:"1"`
+	Quantity int  `mapstructure:"2"`
+	Equipped bool `mapstructure:"3"` // Whether the item is equipped
 	// Similar structure to evNewSimpleItem
 }
 
@@ -22,9 +23,11 @@ func (e *eventNewEquipmentItem) Process(state *albionState) {
 	}
 
 	if e.Quantity < 0 {
-		log.Debugf("Equipment item: ID=%d, Qty=%d, Slot=%d (negative quantity)", e.ItemID, e.Quantity, e.SlotID)
+		log.Debugf("Equipment item: ID=%d, Qty=%d, Slot=%d, Equipped=%v (negative quantity)", 
+			e.ItemID, e.Quantity, e.SlotID, e.Equipped)
 	} else {
-		log.Debugf("Equipment item: ID=%d, Qty=%d, Slot=%d", e.ItemID, e.Quantity, e.SlotID)
+		log.Debugf("Equipment item: ID=%d, Qty=%d, Slot=%d, Equipped=%v", 
+			e.ItemID, e.Quantity, e.SlotID, e.Equipped)
 	}
 	
 	// Check if this event occurred within 4 seconds of a cluster change
@@ -36,10 +39,13 @@ func (e *eventNewEquipmentItem) Process(state *albionState) {
 	}
 	
 	// Check if this event occurred within 3 seconds of a bank vault access
-	isBank := false
-	locationID := ""
+	// We'll use the state variables for backward compatibility, but the inventory tracker
+	// now handles bank vault access internally
+	isBank := state.Inventory.isBank
+	locationID := state.Inventory.currentBankLocation
 	
-	if state.LastBankVaultTime > 0 && time.Now().Unix() - state.LastBankVaultTime <= 3 {
+	// For backward compatibility, also check the state variables
+	if !isBank && state.LastBankVaultTime > 0 && time.Now().Unix() - state.LastBankVaultTime <= 3 {
 		isBank = true
 		locationID = state.LastBankVaultLocationID
 	}
@@ -51,8 +57,8 @@ func (e *eventNewEquipmentItem) Process(state *albionState) {
 		state.Inventory.webhookURL = "" // Temporarily disable webhook
 	}
 	
-	// Update inventory
-	state.Inventory.AddOrUpdateItemWithBank(e.ItemID, e.Quantity, e.SlotID, isBank, locationID)
+	// Update inventory with equipped information
+	state.Inventory.AddOrUpdateEquipmentItem(e.ItemID, e.Quantity, e.SlotID, e.Equipped, isBank, locationID)
 	
 	// Restore webhook URL if we disabled it
 	if !shouldSendWebhook {

@@ -5,7 +5,6 @@ import (
 
 	"github.com/ao-data/albiondata-client/lib"
 	"github.com/ao-data/albiondata-client/log"
-	"github.com/ao-data/albiondata-client/notification"
 )
 
 // CacheSize limit size of messages in cache
@@ -43,17 +42,6 @@ type albionState struct {
 
 func (state albionState) IsValidLocation() bool {
 	if state.LocationId < 0 {
-		if state.LocationId == -1 {
-			log.Error("The players location has not yet been set. Please transition zones so the location can be identified.")
-			if !ConfigGlobal.Debug {
-				notification.Push("The players location has not yet been set. Please transition zones so the location can be identified.")
-			}
-		} else {
-			log.Error("The players location is not valid. Please transition zones so the location can be fixed.")
-			if !ConfigGlobal.Debug {
-				notification.Push("The players location is not valid. Please transition zones so the location can be fixed.")
-			}
-		}
 		return false
 	}
 	return true

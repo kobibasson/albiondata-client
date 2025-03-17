@@ -48,4 +48,10 @@ func (e *eventBankVaultInfo) Process(state *albionState) {
 	lastBankVaultTime = getNow()
 	
 	log.Debugf("Updated global bank vault info: LocationID=%s, Time=%d", lastBankVaultLocationID, lastBankVaultTime)
+	
+	// Notify the inventory tracker of bank vault access
+	if state.Inventory != nil {
+		state.Inventory.NotifyBankVaultAccess(uuid)
+		log.Debugf("Notified inventory tracker of bank vault access: LocationID=%s", uuid)
+	}
 } 

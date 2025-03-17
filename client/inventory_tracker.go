@@ -43,6 +43,7 @@ type WebhookEvent struct {
 	Delta      int    `json:"delta"`      // Change in quantity (positive for increase, negative for decrease)
 	Action     string `json:"action"`     // The action that triggered the webhook (Added, Updated, Removed)
 	SlotID     int    `json:"slot_id,omitempty"` // Optional slot ID for equipment items
+	Equipped   bool   `json:"equipped,omitempty"` // Whether the equipment item is equipped
 	Timestamp  int64  `json:"timestamp"`
 }
 
@@ -66,6 +67,7 @@ type SingleItemWebhookPayload struct {
 	CharacterID   string `json:"character_id"`   // The ID of the character whose inventory was updated
 	CharacterName string `json:"character_name"` // The name of the character whose inventory was updated
 	SlotID        int    `json:"slot_id,omitempty"` // Optional slot ID for equipment items
+	Equipped      bool   `json:"equipped,omitempty"` // Whether the equipment item is equipped
 	IsBank        bool   `json:"is_bank,omitempty"` // Whether this item is in a bank vault
 	LocationID    string `json:"location_id,omitempty"` // Bank vault location ID if applicable
 	Timestamp     int64  `json:"timestamp"`
@@ -204,19 +206,34 @@ func (pi *PlayerInventory) sendBatchedEvents() {
 		return
 	}
 
+	// Check if it's been more than 3 seconds since the last bank access
+	// If so, automatically reset the bank state
+	if pi.isBank {
+		timeSinceBankAccess := time.Since(pi.lastBankAccess)
+		if timeSinceBankAccess > 3*time.Second {
+			fmt.Printf("[WEBHOOK BATCH] Auto-resetting bank state - it's been %v since last bank access\n", timeSinceBankAccess)
+			pi.isBank = false
+			pi.currentBankLocation = ""
+		}
+	}
+
 	fmt.Printf("[WEBHOOK BATCH] Sending batch of %d events\n", len(pi.pendingEvents))
 
 	// Check for equipment items in the batch
 	hasEquipmentItems := false
+	equippedItems := 0
 	for _, event := range pi.pendingEvents {
 		if event.SlotID >= 1000000 { // Equipment items typically have slot IDs over 1,000,000
 			hasEquipmentItems = true
-			break
+			if event.Equipped {
+				equippedItems++
+			}
 		}
 	}
 	
 	if hasEquipmentItems {
-		fmt.Printf("[WEBHOOK BATCH] Batch includes equipment items (slots > 1,000,000)\n")
+		fmt.Printf("[WEBHOOK BATCH] Batch includes %d equipment items (%d equipped, slots > 1,000,000)\n", 
+			countEquipmentItems(pi.pendingEvents), equippedItems)
 	} else {
 		fmt.Printf("[WEBHOOK BATCH] Batch contains only inventory items (no equipment)\n")
 	}
@@ -272,6 +289,17 @@ func (pi *PlayerInventory) sendBatchedEvents() {
 
 	// Clear pending events after send
 	pi.pendingEvents = nil
+}
+
+// countEquipmentItems counts the number of equipment items in a slice of WebhookEvents
+func countEquipmentItems(events []WebhookEvent) int {
+	count := 0
+	for _, event := range events {
+		if event.SlotID >= 1000000 { // Equipment items typically have slot IDs over 1,000,000
+			count++
+		}
+	}
+	return count
 }
 
 // AddOrUpdateItem adds or updates an item in the inventory
@@ -441,6 +469,7 @@ func (pi *PlayerInventory) queueWebhookEventWithBank(action string, itemID int, 
 		SlotID:     slotID,
 		Delta:      delta,
 		Action:     action,
+		Equipped:   false,
 		Timestamp:  time.Now().Unix(),
 	}
 
@@ -468,7 +497,7 @@ func (pi *PlayerInventory) queueWebhookEventWithBank(action string, itemID int, 
 }
 
 // sendWebhookUpdate sends an update to the configured webhook URL
-func (pi *PlayerInventory) sendWebhookUpdate(action string, itemID int, quantity int, oldQuantity int) {
+func (pi *PlayerInventory) sendWebhookUpdate(action string, itemID int, quantity int, oldQuantity int, slotID int, equipped bool) {
 	if pi.webhookURL == "" {
 		return
 	}
@@ -488,6 +517,8 @@ func (pi *PlayerInventory) sendWebhookUpdate(action string, itemID int, quantity
 		Action:        action,
 		CharacterID:   pi.CharacterID,
 		CharacterName: pi.CharacterName,
+		SlotID:        slotID,
+		Equipped:      equipped,
 		Timestamp:     time.Now().Unix(),
 		Override:      override,
 	}
@@ -567,4 +598,107 @@ func (pi *PlayerInventory) NotifyClusterChange() {
 	
 	// Print debug state after cluster change
 	pi.PrintDebugState()
+}
+
+// AddOrUpdateEquipmentItem adds or updates an equipment item in the inventory
+func (pi *PlayerInventory) AddOrUpdateEquipmentItem(itemID int, quantity int, slotID int, equipped bool, isBank bool, locationID string) {
+	pi.mutex.Lock()
+	defer pi.mutex.Unlock()
+
+	now := time.Now().Unix()
+	var action string
+	var oldQuantity int
+	
+	// Handle negative quantities (likely due to byte overflow in the game client)
+	originalQuantity := quantity
+	if quantity < 0 {
+		if quantity >= -127 {
+			// For values between -1 and -127, add 256 to get the actual quantity
+			// This is similar to how the auction code handles negative item amounts
+			quantity = 256 + quantity
+			log.Debugf("Converting negative quantity %d to %d for item %d (likely a stack overflow)", 
+				originalQuantity, quantity, itemID)
+		} else {
+			// For very negative values, we're not sure how to interpret them
+			// Log a warning but keep the original value
+			log.Warnf("Received very negative quantity %d for item %d, keeping as is", 
+				quantity, itemID)
+		}
+	}
+
+	if item, exists := pi.Items[itemID]; exists {
+		oldQuantity = item.Quantity
+		action = "Updated"
+		item.Quantity = quantity
+		item.SlotID = slotID
+		item.LastSeen = now
+	} else {
+		oldQuantity = 0
+		action = "Added"
+		pi.Items[itemID] = &InventoryItem{
+			ItemID:   itemID,
+			Quantity: quantity,
+			SlotID:   slotID,
+			LastSeen: now,
+		}
+	}
+
+	pi.LastUpdated = now
+	
+	// Queue webhook update with equipped information
+	if pi.webhookURL != "" {
+		// For webhook, we'll send the corrected quantity but include the original in the debug message
+		if originalQuantity < 0 && quantity != originalQuantity {
+			log.Debugf("Converting negative quantity %d to %d for item %d", 
+				originalQuantity, quantity, itemID)
+		}
+		pi.queueWebhookEventWithEquipped(action, itemID, quantity, oldQuantity, slotID, equipped, isBank, locationID)
+	}
+	
+	// Only save to file if an output path is provided
+	if pi.outputPath != "" {
+		pi.SaveToFile()
+	}
+}
+
+// queueWebhookEventWithEquipped adds an event to the pending events queue with equipped information
+func (pi *PlayerInventory) queueWebhookEventWithEquipped(action string, itemID int, quantity int, oldQuantity int, slotID int, equipped bool, isBank bool, locationID string) {
+	if pi.webhookURL == "" {
+		return
+	}
+
+	// Calculate the delta (change in quantity)
+	delta := quantity - oldQuantity
+
+	event := WebhookEvent{
+		ItemID:     itemID,
+		Quantity:   quantity,
+		SlotID:     slotID,
+		Delta:      delta,
+		Action:     action,
+		Equipped:   equipped,
+		Timestamp:  time.Now().Unix(),
+	}
+
+	// Add the event to the queue
+	pi.eventMutex.Lock()
+	defer pi.eventMutex.Unlock()
+	
+	pi.pendingEvents = append(pi.pendingEvents, event)
+	pi.lastEventTime = time.Now() // Track when the last event was added
+	
+	// If we're within 10 seconds of a cluster change, use a shorter batch timer (2 seconds)
+	// Otherwise, use the standard 10 second timer
+	var waitTime time.Duration
+	timeSinceClusterChange := time.Since(pi.lastClusterChange)
+	if timeSinceClusterChange <= 10*time.Second {
+		waitTime = 2 * time.Second
+		fmt.Printf("[WEBHOOK] Batch size: %d events (waiting 2s for more events - after cluster change)\n", len(pi.pendingEvents))
+	} else {
+		waitTime = 10 * time.Second
+		fmt.Printf("[WEBHOOK] Batch size: %d events (waiting 10s for more events)\n", len(pi.pendingEvents))
+	}
+	
+	// Reset the timer with the appropriate wait time
+	pi.batchTimer.Reset(waitTime)
 } 
