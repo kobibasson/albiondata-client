@@ -1,16 +1,8 @@
 # Albion Online Inventory Tracking
 
-This feature allows you to track your character's inventory in Albion Online and save it to a local JSON file or send updates to a webhook.
+This feature allows you to track your character's inventory in Albion Online and send updates to a webhook endpoint.
 
 ## How to Use
-
-### Local JSON File Tracking
-
-Run the Albion Data Client with the `-inventory-output` flag to specify the path where you want to save the inventory JSON file:
-
-```
-albiondata-client.exe -inventory-output "C:\path\to\inventory.json"
-```
 
 ### Webhook Integration
 
@@ -20,15 +12,9 @@ You can send inventory updates to a webhook endpoint by using the `-inventory-we
 albiondata-client.exe -inventory-webhook "http://localhost:3000/api/inventory/webhook"
 ```
 
-You can use the webhook without saving to a JSON file, or you can combine both features:
-
-```
-albiondata-client.exe -inventory-output "C:\path\to\inventory.json" -inventory-webhook "http://localhost:3000/api/inventory/webhook"
-```
-
 ### Debug Information
 
-You can also combine these flags with debug flags to see more information:
+You can combine this flag with debug flags to see more information:
 
 ```
 albiondata-client.exe -debug -events 32,26,27 -inventory-webhook "http://localhost:3000/api/inventory/webhook"
@@ -39,57 +25,59 @@ This will show debug information for the following events:
 - `evInventoryPutItem` (26): When items are added to your inventory
 - `evInventoryDeleteItem` (27): When items are removed from your inventory
 
-## Real-time Inventory Change Messages
+## How It Works
 
-When you run the application with the `-inventory-output` or `-inventory-webhook` flag, you'll see real-time messages about inventory changes in the console, even without the `-debug` flag. These messages include:
+The inventory tracking feature works by monitoring game events and operations, then sending webhook updates with inventory changes. There are three main tracking mechanisms, each with different behavior:
 
-- When items are added to your inventory
-- When item quantities are updated (with the change amount)
-- When items are removed from your inventory
-- When your character information is updated
+### 1. Bank Inventory Tracking
 
-Example messages:
-```
-[Inventory] Added item: ID=909, Quantity=122
-[Inventory] Updated item: ID=909, Quantity=244 (+122)
-[Inventory] Updated item: ID=912, Quantity=911 (+3)
-[Inventory] Removed item: ID=909, Quantity was 244
-```
+**Trigger Event**: `opAssetOverviewTabContent` operation
 
-## Webhook Debug Information
+When the player opens a bank vault tab, this operation is detected and triggers the bank inventory tracking mode. The system:
 
-When using the `-inventory-webhook` flag, you'll see detailed debug information about the webhook requests and responses:
+- Opens a queue for collecting subsequent inventory events
+- Assigns a location ID (1-5) to identify different bank tabs
+  - Location IDs increment each time a new tab is viewed (1→2→3→4→5→1)
+  - IDs reset to 1 after reaching 5 or after 10 seconds of inactivity
+- Collects all `evNewSimpleItem` and `evNewEquipmentItem` events that occur while the queue is open
+- Sends a webhook payload with:
+  - `override: true` - indicating this data should replace previous bank inventory data
+  - `bank: true` - indicating these are bank items
+  - `location_id` - the assigned bank tab index (1-5)
 
-```
-[Webhook] Queuing: Added for item 909 (Qty: 122, Delta: +122)
-[Webhook] Batch size: 1 events (waiting 3s for more events)
-[Webhook] Sending batch of 1 events
-[Webhook] SUCCESS: Server responded with status code 200
-[Webhook] Response: {"success":true}
+The bank queue closes after 10 seconds of inactivity or immediately if it's been more than 10 seconds since the last tab content event. The queue will only reopen when another `opAssetOverviewTabContent` operation is detected.
 
-[Webhook] Queuing: Updated for item 912 (Qty: 946, Delta: +5)
-[Webhook] Batch size: 1 events (waiting 3s for more events)
-[Webhook] Sending batch of 1 events
-[Webhook] SUCCESS: Server responded with status code 200
-[Webhook] Response: {"success":true}
-```
+### 2. Player Inventory Synchronization
 
-If there are any errors, you'll see detailed error messages:
+**Trigger Event**: Cluster change event (`opChangeCluster`)
 
-```
-[Webhook] Queuing: Updated for item 912 (Qty: 946, Delta: +5)
-[Webhook] Batch size: 1 events (waiting 3s for more events)
-[Webhook] Sending batch of 1 events
-[Webhook] ERROR: Failed to send webhook: dial tcp [::1]:3000: connectex: No connection could be made because the target machine actively refused it.
-```
+When the player changes clusters (zones), this triggers a full inventory synchronization:
 
-This makes it easy to debug webhook integration issues without having to enable the full debug mode.
+- Opens a queue for collecting subsequent inventory events
+- Keeps the queue open for 4 seconds
+- Collects all `evNewSimpleItem` and `evNewEquipmentItem` events that occur while the queue is open
+- Sends a webhook payload with:
+  - `override: true` - indicating this data should replace previous player inventory data
+  - `bank: false` - indicating these are player inventory items
+  - `location_id: "0"` - indicating player inventory (not bank)
 
-## Webhook Integration
+The queue closes after 4 seconds and will only reopen when another cluster change event is detected.
 
-The webhook feature sends a JSON payload to the specified URL whenever your inventory changes. The payload includes:
+### 3. Default Inventory Updates
 
-### Example without bank access:
+**Trigger**: Any inventory event without a preceding trigger event
+
+For inventory changes that occur outside of bank access or cluster changes:
+
+- Processes individual `evNewSimpleItem` and `evNewEquipmentItem` events
+- Sends a webhook payload with:
+  - `override: false` - indicating these are incremental updates
+  - `bank: false` - indicating these are player inventory items
+  - `location_id: "0"` - indicating player inventory (not bank)
+
+## Webhook Payload Format
+
+### Player Inventory Example:
 
 ```json
 {
@@ -119,7 +107,7 @@ The webhook feature sends a JSON payload to the specified URL whenever your inve
 }
 ```
 
-### Example with bank access:
+### Bank Inventory Example:
 
 ```json
 {
@@ -130,105 +118,58 @@ The webhook feature sends a JSON payload to the specified URL whenever your inve
       "slot_id": 0,
       "delta": 122,
       "action": "Added",
-      "timestamp": 1709971612
+      "timestamp": 1709971612,
+      "location_id": "3"
     }
   ],
   "character_id": "your-character-uuid",
   "character_name": "YourCharacterName",
   "batch_timestamp": 1709971618,
-  "override": false,
-  "bank": true,
-  "location_id": "7925feb4-f097-4d32-a025-4e65082a3992"
+  "override": true,
+  "bank": true
 }
 ```
 
-The `override` flag is set to `true` when any of the following events occur within 3 seconds of the batch:
-- Player joins a new zone (`opJoin`)
-- Player leaves a zone (detected via `evUpdateChatSettings`)
-- Player changes clusters (`opChangeCluster`)
+## Payload Fields Explained
 
-The `bank` flag is always included in the payload and defaults to `false`. It is set to `true` when the batch is related to a bank vault access (within 3 seconds before or after). When `bank` is `true`, the `location_id` field is also included, containing the UUID of the bank vault, which can be used to identify the city. For example:
-- `7925feb4-f097-4d32-a025-4e65082a3992` is the Thetford bank vault
-- `f56a368d-2f0b-4d01-a1ba-0079cf8b1fa9` is the Fort Sterling bank vault
-
-Note that the location ID is just the UUID part, without the `@` sign and any additional information that follows it in the original game data.
-
-This flag can be used by your webhook handler to determine if it should override previous inventory data, which is useful when the player is transitioning between zones or logging out.
-
-You can use this webhook to integrate with other applications, such as:
-- A custom web dashboard to monitor your inventory
-- A Discord bot to notify you of important inventory changes
-- A database to track your gathering efficiency over time
-- Any other application that can receive HTTP POST requests
-
-## JSON File Format
-
-The inventory JSON file will have the following format:
-
-```json
-{
-  "character_id": "your-character-uuid",
-  "character_name": "YourCharacterName",
-  "items": {
-    "909": {
-      "item_id": 909,
-      "quantity": 122,
-      "slot_id": 0,
-      "last_seen": 1709971612
-    },
-    "912": {
-      "item_id": 912,
-      "quantity": 911,
-      "slot_id": 1,
-      "last_seen": 1709971678
-    }
-  },
-  "last_updated": 1709971678
-}
-```
-
-- `character_id`: Your character's unique identifier
-- `character_name`: Your character's name
-- `items`: A map of items in your inventory, where the key is the item ID
+- `events`: Array of inventory events
   - `item_id`: The ID of the item
-  - `quantity`: The quantity of the item
-  - `slot_id`: The slot ID of the item in your inventory
-  - `last_seen`: The timestamp when the item was last seen (Unix timestamp)
-- `last_updated`: The timestamp when the inventory was last updated (Unix timestamp)
+  - `quantity`: The current quantity of the item
+  - `slot_id`: The slot ID of the item in the inventory
+  - `delta`: The change in quantity (positive for increase, negative for decrease)
+  - `action`: The action that triggered the event (Added, Updated, Removed)
+  - `timestamp`: The Unix timestamp when the event occurred
+  - `location_id`: For bank items, the bank tab index (1-5); for player inventory, "0"
+  - `equipped`: For equipment items, whether the item is equipped (boolean)
 
-## How It Works
+- `character_id`: The UUID of the character
+- `character_name`: The name of the character
+- `batch_timestamp`: The Unix timestamp when the batch was sent
+- `override`: Whether this batch should override previous inventory data
+  - `true` for bank operations and cluster changes
+  - `false` for incremental updates
+- `bank`: Whether this batch contains bank items
+  - `true` for bank operations
+  - `false` for player inventory
 
-The inventory tracking feature works by monitoring the following game events:
+## Implementation Details
 
-1. `evNewSimpleItem`: When you gather or receive new items
-2. `evNewEquipmentItem`: When you receive equipment items
-3. `evBankVaultInfo`: When you access a bank vault
+The system uses different queues and timers to manage the three tracking mechanisms:
 
-When any of these events occur, the inventory tracker updates the JSON file (if enabled) and sends a webhook update (if enabled).
+1. **Bank Inventory**: Triggered by `opAssetOverviewTabContent`, uses location IDs 1-5, always sets `override: true` and `bank: true`
 
-## Item IDs
+2. **Player Inventory Sync**: Triggered by cluster changes, uses a 4-second queue, sets `override: true` and `bank: false`
 
-The item IDs in the inventory data correspond to the item IDs in Albion Online. You can use these IDs to identify the items in your inventory.
+3. **Default Updates**: No trigger event, processes individual events, sets `override: false` and `bank: false`
 
-For example, from the debug logs you provided:
-- Item ID 909: Logs (T4 resource)
-- Item ID 912: Rough Logs (T5 resource)
-
-You can find more information about item IDs in the Albion Online Data Project or other community resources.
+All three mechanisms use the same underlying event handlers for `evNewSimpleItem` and `evNewEquipmentItem`, but with different metadata based on the trigger event.
 
 ## Troubleshooting
 
-If you're not seeing any updates to your inventory file:
+If you're not receiving inventory updates:
 
-1. Make sure you're running the Albion Data Client with the `-inventory-output` flag
-2. Check that you have the correct path specified for the output file
-3. Try running with the `-debug` flag to see more information
-4. Make sure you're performing actions in the game that would trigger inventory updates (gathering, trading, etc.)
-
-If you're using the webhook feature and not receiving updates:
-
-1. Check that your webhook server is running and accessible
-2. Verify that the URL is correct and includes the protocol (http:// or https://)
+1. Make sure you're running the Albion Data Client with the `-inventory-webhook` flag
+2. Verify that your webhook server is running and accessible
 3. Look for webhook error messages in the Albion Data Client console
 4. Make sure your webhook server is properly handling the POST requests
 

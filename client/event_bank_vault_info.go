@@ -30,25 +30,8 @@ type eventBankVaultInfo struct {
 
 // Process handles the evBankVaultInfo event
 func (e *eventBankVaultInfo) Process(state *albionState) {
-	// Log the event for debugging
-	log.Debugf("Processing evBankVaultInfo: LocationID=%s (Used for filtering evNewSimpleItem events)", e.LocationID)
+	// Log that we're ignoring this event
+	log.Debugf("Ignoring evBankVaultInfo event: LocationID=%s (event is not processed)", e.LocationID)
 	
-	// Extract just the UUID part from the location ID
-	uuid := extractUUID(e.LocationID)
-	
-	// Store the bank vault info in the state for reference and filtering
-	state.LastBankVaultLocationID = uuid
-	state.LastBankVaultTime = getNow()
-	
-	// Update global variables for reference
-	bankVaultMutex.Lock()
-	defer bankVaultMutex.Unlock()
-	
-	lastBankVaultLocationID = uuid
-	lastBankVaultTime = getNow()
-	
-	log.Debugf("Updated LastBankVaultTime to %d for filtering evNewSimpleItem events", state.LastBankVaultTime)
-	
-	// No longer notifying inventory tracker from this event
-	// Bank vault access is now handled by asset overview tab content operations
+	// Do nothing - we're ignoring bank vault events completely
 } 

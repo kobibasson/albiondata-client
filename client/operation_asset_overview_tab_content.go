@@ -26,6 +26,8 @@ type operationAssetOverviewTabContent struct {
 }
 
 // Process handles the opAssetOverviewTabContent operation
+// IMPORTANT: This is the ONLY operation that should trigger bank queues.
+// Bank vault access notifications should only update state, not trigger queues.
 func (op operationAssetOverviewTabContent) Process(state *albionState) {
 	tabIDHex := hex.EncodeToString(op.TabID)
 	fmt.Printf("\n[OPERATION] ===== DETECTED opAssetOverviewTabContent: TabID=%s, Items=%d =====\n", tabIDHex, len(op.ItemIDs))
@@ -144,6 +146,13 @@ func (op operationAssetOverviewTabContent) Process(state *albionState) {
 			fmt.Printf("[BANK CONTENT] More than 10 seconds since last tab content event, sending batch update now\n")
 			log.Infof("[BANK CONTENT] More than 10 seconds since last tab content event, sending batch update now")
 			state.Inventory.SendBankItemsBatch(tabName, locationIDStr)
+			
+			// Reset the location ID to 1 after sending the batch
+			if locationID == 5 {
+				state.LastTabContentLocationID = 0 // Will become 1 on next event
+				log.Infof("[BANK CONTENT] Reset location ID to 0 after sending batch with locationId = 5")
+				fmt.Printf("[BANK CONTENT] Reset location ID to 0 after sending batch with locationId = 5\n")
+			}
 		} else {
 			// Otherwise, just log that we're waiting to send the batch
 			fmt.Printf("[BANK CONTENT] Queueing items for batch update (will send after 10 seconds of inactivity)\n")

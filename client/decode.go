@@ -109,7 +109,7 @@ func decodeEvent(params map[uint8]interface{}) (event operation, err error) {
 		event = &eventNewSimpleItem{}
 	case evNewEquipmentItem:
 		event = &eventNewEquipmentItem{}
-	// Bank vault events are now processed again to track timing for evNewSimpleItem filtering
+	// Bank vault events are processed but ignored
 	case evBankVaultInfo:
 		event = &eventBankVaultInfo{}
 	default:

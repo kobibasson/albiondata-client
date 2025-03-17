@@ -14,13 +14,6 @@ import (
 	"github.com/ao-data/albiondata-client/log"
 )
 
-// Global variables for bank vault information
-var (
-	lastBankVaultTime     int64
-	lastBankVaultLocationID string
-	bankVaultMutex        sync.Mutex
-)
-
 // Helper function to get absolute value of int64
 func abs(n int64) int64 {
 	if n < 0 {
@@ -299,7 +292,19 @@ func (pi *PlayerInventory) sendBatchedEvents() {
 		// Update the location ID in each event
 		for i := range pi.pendingEvents {
 			if pi.pendingEvents[i].LocationID == "" {
-				pi.pendingEvents[i].LocationID = pi.currentBankLocation
+				// If this is not a tab content event (currentBankLocation is not a number 1-5), use "0"
+				if !isValidTabContentLocationID(pi.currentBankLocation) {
+					pi.pendingEvents[i].LocationID = "0"
+				} else {
+					pi.pendingEvents[i].LocationID = pi.currentBankLocation
+				}
+			}
+		}
+	} else {
+		// If not in a bank, ensure all events have locationId = "0"
+		for i := range pi.pendingEvents {
+			if pi.pendingEvents[i].LocationID == "" {
+				pi.pendingEvents[i].LocationID = "0"
 			}
 		}
 	}
@@ -578,18 +583,8 @@ func (pi *PlayerInventory) AddOrUpdateItemWithBank(itemID int, quantity int, slo
 				originalQuantity, quantity, itemID)
 		}
 		
-		// Check if a bank vault info event occurred within 2 seconds
-		bankVaultMutex.Lock()
-		currentBankVaultTime := lastBankVaultTime
-		bankVaultMutex.Unlock()
-		
-		timeSinceLastBankVault := now - currentBankVaultTime
-		if timeSinceLastBankVault <= 2 && !isBank {
-			log.Debugf("Skipping webhook queue for item %d: occurred within 2 seconds of evBankVaultInfo event (time diff: %d sec)", 
-				itemID, timeSinceLastBankVault)
-		} else {
-			pi.queueWebhookEventWithBank(action, itemID, quantity, oldQuantity, slotID, isBank, locationID)
-		}
+		// Queue the webhook event - no longer checking for bank vault events
+		pi.queueWebhookEventWithBank(action, itemID, quantity, oldQuantity, slotID, isBank, locationID)
 	}
 	
 	// Only save to file if an output path is provided
@@ -607,8 +602,19 @@ func (pi *PlayerInventory) queueWebhookEventWithBank(action string, itemID int, 
 	// Calculate the delta (change in quantity)
 	delta := quantity - oldQuantity
 	
-	fmt.Printf("[WEBHOOK QUEUE] Queueing event: Action=%s, ItemID=%d, Quantity=%d, Delta=%d, SlotID=%d, IsBank=%v, LocationID=%s\n",
-		action, itemID, quantity, delta, slotID, isBank, locationID)
+	// If this is not a tab content event (locationID is empty or not a number 1-5), use "0"
+	if locationID == "" || !isValidTabContentLocationID(locationID) {
+		locationID = "0"
+	}
+	
+	// Log the event being queued
+	if isBank {
+		fmt.Printf("[WEBHOOK QUEUE] Queueing BANK event: Action=%s, ItemID=%d, Quantity=%d, Delta=%d, SlotID=%d, LocationID=%s\n",
+			action, itemID, quantity, delta, slotID, locationID)
+	} else {
+		fmt.Printf("[WEBHOOK QUEUE] Queueing event: Action=%s, ItemID=%d, Quantity=%d, Delta=%d, SlotID=%d\n",
+			action, itemID, quantity, delta, slotID)
+	}
 
 	event := WebhookEvent{
 		ItemID:     itemID,
@@ -630,23 +636,28 @@ func (pi *PlayerInventory) queueWebhookEventWithBank(action string, itemID int, 
 	
 	fmt.Printf("[WEBHOOK QUEUE] Added event to queue. Queue size now: %d events\n", len(pi.pendingEvents))
 	
-	// If we're within 10 seconds of a cluster change, use a shorter batch timer (2 seconds)
-	// Otherwise, use the standard 10 second timer
-	var waitTime time.Duration
-	timeSinceClusterChange := time.Since(pi.lastClusterChange)
-	if timeSinceClusterChange <= 10*time.Second {
-		waitTime = 2 * time.Second
-		fmt.Printf("[WEBHOOK TIMER] Setting batch timer to 2s (within 10s of cluster change)\n")
+	// Only set the regular batch timer for non-bank events
+	// Bank events should only be sent via the explicit SendBankItemsBatch call
+	if !isBank {
+		// If we're within 10 seconds of a cluster change, use a shorter batch timer (2 seconds)
+		// Otherwise, use the standard 10 second timer
+		var waitTime time.Duration
+		timeSinceClusterChange := time.Since(pi.lastClusterChange)
+		if timeSinceClusterChange <= 10*time.Second {
+			waitTime = 2 * time.Second
+			fmt.Printf("[WEBHOOK TIMER] Setting batch timer to 2s (within 10s of cluster change)\n")
+		} else {
+			waitTime = 10 * time.Second
+			fmt.Printf("[WEBHOOK TIMER] Setting batch timer to 10s (normal operation)\n")
+		}
+		
+		// Reset the timer with the appropriate wait time
+		oldTimerActive := pi.batchTimer.Stop()
+		pi.batchTimer.Reset(waitTime)
+		fmt.Printf("[WEBHOOK TIMER] Timer reset: waitTime=%v, oldTimerActive=%v\n", waitTime, oldTimerActive)
 	} else {
-		waitTime = 10 * time.Second
-		fmt.Printf("[WEBHOOK TIMER] Setting batch timer to 10s (normal operation)\n")
+		fmt.Printf("[WEBHOOK TIMER] Not resetting timer for bank event - will be sent by explicit bank batch\n")
 	}
-	
-	// Reset the timer with the appropriate wait time
-	oldTimerActive := pi.batchTimer.Stop()
-	pi.batchTimer.Reset(waitTime)
-	
-	fmt.Printf("[WEBHOOK TIMER] Timer reset: waitTime=%v, oldTimerActive=%v\n", waitTime, oldTimerActive)
 }
 
 // sendWebhookUpdate sends an update to the configured webhook URL
@@ -666,6 +677,11 @@ func (pi *PlayerInventory) sendWebhookUpdate(action string, itemID int, quantity
 	// Check if we're in a bank
 	isBank := pi.isBank
 	locationID := pi.currentBankLocation
+	
+	// If this is not a tab content event (locationID is empty or not a number 1-5), use "0"
+	if locationID == "" || !isValidTabContentLocationID(locationID) {
+		locationID = "0"
+	}
 	
 	payload := SingleItemWebhookPayload{
 		ItemID:        itemID,
@@ -705,9 +721,19 @@ func (pi *PlayerInventory) sendWebhookUpdate(action string, itemID int, quantity
 }
 
 // NotifyBankVaultAccess updates the bank vault access time and location
+// This should ONLY be called from operationAssetOverviewTabContent.Process
+// NOTE: This method only updates state and does NOT trigger bank queues.
+// Bank queues are ONLY triggered by operationAssetOverviewTabContent.Process
 func (pi *PlayerInventory) NotifyBankVaultAccess(locationID string) {
 	pi.eventMutex.Lock()
 	defer pi.eventMutex.Unlock()
+	
+	// Validate that this is a bank operation with a valid location ID
+	if !isValidTabContentLocationID(locationID) {
+		log.Warnf("[BANK ACCESS] Attempted to notify bank access with invalid location ID: %s", locationID)
+		fmt.Printf("[BANK ACCESS] Attempted to notify bank access with invalid location ID: %s\n", locationID)
+		return
+	}
 	
 	// Store previous state for logging
 	prevIsBank := pi.isBank
@@ -726,31 +752,12 @@ func (pi *PlayerInventory) NotifyBankVaultAccess(locationID string) {
 	fmt.Printf("[BANK ACCESS] Webhook URL: %s\n", pi.webhookURL)
 	fmt.Printf("[BANK ACCESS] Webhook Enabled: %v\n", pi.webhookURL != "")
 	fmt.Printf("[BANK ACCESS] Pending Events: %d\n", len(pi.pendingEvents))
+	fmt.Printf("[BANK ACCESS] NOTE: This method only updates state and does NOT trigger bank queues\n")
 	fmt.Printf("[BANK ACCESS] ===== END BANK VAULT ACCESS =====\n\n")
 	
-	log.Infof("[BANK ACCESS] Detected bank vault access at location %s", locationID)
-	log.Infof("[BANK ACCESS] Previous bank state: isBank=%v, location=%s", prevIsBank, prevLocation)
-	log.Infof("[BANK ACCESS] Current state: Webhook URL=%s, Enabled=%v, Pending Events=%d", 
-		pi.webhookURL, pi.webhookURL != "", len(pi.pendingEvents))
-	
-	// Update global bank vault information
-	bankVaultMutex.Lock()
-	defer bankVaultMutex.Unlock()
-	
-	lastBankVaultTime = time.Now().Unix()
-	lastBankVaultLocationID = locationID
-	
-	log.Infof("[BANK ACCESS] Updated global bank vault information: time=%d, location=%s", 
-		lastBankVaultTime, lastBankVaultLocationID)
-	
-	// Check if we need to reset the batch timer for faster processing
-	if pi.webhookURL != "" && len(pi.pendingEvents) > 0 {
-		// For bank access, we want to process events quickly
-		oldTimerActive := pi.batchTimer.Stop()
-		pi.batchTimer.Reset(2 * time.Second)
-		log.Infof("[BANK ACCESS] Reset batch timer to 2s (oldTimerActive=%v)", oldTimerActive)
-		fmt.Printf("[BANK ACCESS] Reset batch timer to 2s for faster processing\n")
-	}
+	log.Infof("[BANK ACCESS] Bank vault access detected - Location ID: %s, Previous: isBank=%v, location=%s", 
+		locationID, prevIsBank, prevLocation)
+	log.Infof("[BANK ACCESS] NOTE: Bank vault access only updates state and does NOT trigger bank queues")
 }
 
 // NotifyLeaveBankVault updates the state when leaving a bank vault
@@ -867,6 +874,11 @@ func (pi *PlayerInventory) queueWebhookEventWithEquipped(action string, itemID i
 	// Calculate the delta (change in quantity)
 	delta := quantity - oldQuantity
 
+	// If this is not a tab content event (locationID is empty or not a number 1-5), use "0"
+	if locationID == "" || !isValidTabContentLocationID(locationID) {
+		locationID = "0"
+	}
+
 	event := WebhookEvent{
 		ItemID:     itemID,
 		Quantity:   quantity,
@@ -954,7 +966,15 @@ func (pi *PlayerInventory) AddOrUpdateBankItem(itemID int, quantity int, slotID 
 }
 
 // SendBankItemsBatch sends a batch update with all bank items
+// This should ONLY be called from operationAssetOverviewTabContent.Process or via SetBankBatchTimer
 func (pi *PlayerInventory) SendBankItemsBatch(tabName string, locationID string) {
+	// Validate that this is a bank operation with a valid location ID
+	if !isValidTabContentLocationID(locationID) {
+		log.Warnf("[WEBHOOK BANK BATCH] Attempted to send bank batch with invalid location ID: %s", locationID)
+		fmt.Printf("[WEBHOOK BANK BATCH] Attempted to send bank batch with invalid location ID: %s\n", locationID)
+		return
+	}
+
 	fmt.Printf("\n[WEBHOOK BANK BATCH] ===== ATTEMPTING TO SEND BANK ITEMS BATCH =====\n")
 	log.Infof("[WEBHOOK BANK BATCH] Starting bank items batch send for tab: %s, location: %s", tabName, locationID)
 	
@@ -1007,21 +1027,18 @@ func (pi *PlayerInventory) SendBankItemsBatch(tabName string, locationID string)
 		Events:         pi.pendingEvents,
 		CharacterID:    pi.CharacterID,
 		CharacterName:  pi.CharacterName,
-		BatchTimestamp:   time.Now().Unix(),
-		Override:         override, // Always true for bank items
-		Bank:             true,
+		BatchTimestamp: time.Now().Unix(),
+		Override:       override, // Always true for bank items
+		Bank:           true,
 	}
 
-	if pi.isBank && pi.currentBankLocation != "" {
-		fmt.Printf("[WEBHOOK BANK BATCH] Including location ID in events: %s\n", pi.currentBankLocation)
-		log.Infof("[WEBHOOK BANK BATCH] Including location ID in events: %s", pi.currentBankLocation)
-		
-		// Update the location ID in each event
-		for i := range pi.pendingEvents {
-			if pi.pendingEvents[i].LocationID == "" {
-				pi.pendingEvents[i].LocationID = pi.currentBankLocation
-			}
-		}
+	// Set the location ID for all events in the batch
+	fmt.Printf("[WEBHOOK BANK BATCH] Setting location ID to %s for all events in batch\n", locationID)
+	log.Infof("[WEBHOOK BANK BATCH] Setting location ID to %s for all events in batch", locationID)
+	
+	// Update the location ID in each event to match the current bank tab
+	for i := range pi.pendingEvents {
+		pi.pendingEvents[i].LocationID = locationID
 	}
 
 	// Don't print the full payload to reduce log verbosity
@@ -1140,12 +1157,27 @@ func (pi *PlayerInventory) SendBankItemsBatch(tabName string, locationID string)
 
 	// Reset retry counter on success
 	pi.webhookRetryCount = 0
+	
+	// If we just sent a batch with locationId = "5", log it
+	if locationID == "5" {
+		log.Infof("[WEBHOOK BANK BATCH] Sent batch with locationId = 5, should reset location ID")
+		fmt.Printf("[WEBHOOK BANK BATCH] Sent batch with locationId = 5, should reset location ID\n")
+	}
 }
 
 // SetBankBatchTimer sets a timer to send the bank batch after the specified duration
+// This should ONLY be called from operationAssetOverviewTabContent.Process
+// IMPORTANT: Bank batches are ONLY triggered by tab content operations, not by bank vault access notifications
 func (pi *PlayerInventory) SetBankBatchTimer(duration time.Duration, tabName string, locationID string) {
 	pi.eventMutex.Lock()
 	defer pi.eventMutex.Unlock()
+	
+	// Validate that this is a bank operation with a valid location ID
+	if !isValidTabContentLocationID(locationID) {
+		log.Warnf("[BANK BATCH TIMER] Attempted to set bank batch timer with invalid location ID: %s", locationID)
+		fmt.Printf("[BANK BATCH TIMER] Attempted to set bank batch timer with invalid location ID: %s\n", locationID)
+		return
+	}
 	
 	// Stop any existing timer
 	if pi.batchTimer != nil {
@@ -1157,8 +1189,19 @@ func (pi *PlayerInventory) SetBankBatchTimer(duration time.Duration, tabName str
 		fmt.Printf("\n[BANK BATCH TIMER] Timer expired after %v, sending bank items batch\n", duration)
 		log.Infof("[BANK BATCH TIMER] Timer expired after %v, sending bank items batch", duration)
 		pi.SendBankItemsBatch(tabName, locationID)
+		
+		// If we just sent a batch with locationId = "5", notify the caller to reset the location ID
+		if locationID == "5" {
+			log.Infof("[BANK BATCH TIMER] Sent batch with locationId = 5, should reset location ID")
+			fmt.Printf("[BANK BATCH TIMER] Sent batch with locationId = 5, should reset location ID\n")
+		}
 	})
 	
-	fmt.Printf("[BANK BATCH TIMER] Set timer to send bank items batch after %v\n", duration)
-	log.Infof("[BANK BATCH TIMER] Set timer to send bank items batch after %v", duration)
+	fmt.Printf("[BANK BATCH TIMER] Set timer to send bank items batch after %v for location ID %s\n", duration, locationID)
+	log.Infof("[BANK BATCH TIMER] Set timer to send bank items batch after %v for location ID %s", duration, locationID)
+}
+
+// isValidTabContentLocationID checks if a locationID is a valid tab content ID (1-5)
+func isValidTabContentLocationID(locationID string) bool {
+	return locationID == "1" || locationID == "2" || locationID == "3" || locationID == "4" || locationID == "5"
 } 
