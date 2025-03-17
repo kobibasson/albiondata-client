@@ -34,12 +34,13 @@ type InventoryItem struct {
 type WebhookEvent struct {
 	ItemID     int    `json:"item_id"`
 	Quantity   int    `json:"quantity"`
-	Delta      int    `json:"delta"`      // Change in quantity (positive for increase, negative for decrease)
-	Action     string `json:"action"`     // The action that triggered the webhook (Added, Updated, Removed)
-	SlotID     int    `json:"slot_id,omitempty"` // Optional slot ID for equipment items
-	Equipped   bool   `json:"equipped,omitempty"` // Whether the equipment item is equipped
+	SlotID     int    `json:"slot_id"`
+	Delta      int    `json:"delta"`
+	Action     string `json:"action"`
+	Equipped   bool   `json:"equipped,omitempty"`
 	Timestamp  int64  `json:"timestamp"`
-	LocationID string `json:"location_id,omitempty"` // ID of the bank location for this item
+	LocationID string `json:"location_id,omitempty"`
+	IsBank     bool   `json:"-"` // Not sent to webhook, used internally
 }
 
 // WebhookPayload represents the data sent to the webhook
@@ -102,10 +103,16 @@ type PlayerInventory struct {
 	lastEventTime      time.Time
 	// Add a retry counter
 	webhookRetryCount int
+	// Timer for bank batch events
+	bankBatchTimer *time.Timer
 }
 
 // NewPlayerInventory creates a new player inventory tracker
 func NewPlayerInventory(outputPath string, webhookURL string) *PlayerInventory {
+	// Set initial time to be well in the past (30 minutes ago)
+	// This ensures we don't start with short timers thinking we're close to a cluster change
+	initialTime := time.Now().Add(-30 * time.Minute)
+	
 	pi := &PlayerInventory{
 		Items:          make(map[int]*InventoryItem),
 		outputPath:     outputPath,
@@ -113,11 +120,11 @@ func NewPlayerInventory(outputPath string, webhookURL string) *PlayerInventory {
 		webhookURL:     webhookURL,
 		pendingEvents:  make([]WebhookEvent, 0),
 		webhookRetryCount: 0, // Initialize retry counter
-		lastClusterChange: time.Now(),
-		lastJoinTime:      time.Now(),
-		lastLeaveTime:     time.Now(),
-		lastBankAccess:    time.Now(),
-		lastEventTime:     time.Now(),
+		lastClusterChange: initialTime,
+		lastJoinTime:      initialTime,
+		lastLeaveTime:     initialTime,
+		lastBankAccess:    initialTime,
+		lastEventTime:     initialTime,
 	}
 	
 	// Initialize the batch timer but don't start it yet
@@ -135,18 +142,7 @@ func (pi *PlayerInventory) OnClusterChange() {
 	defer pi.eventMutex.Unlock()
 	
 	pi.lastClusterChange = time.Now()
-	fmt.Printf("[CLUSTER] Changed at %v\n", pi.lastClusterChange)
-	
-	// Print debug state after cluster change
-	pi.mutex.Lock()
-	defer pi.mutex.Unlock()
-	
-	fmt.Printf("\n[DEBUG] Inventory Tracker State after cluster change:\n")
-	fmt.Printf("  Character: %s (%s)\n", pi.CharacterName, pi.CharacterID)
-	fmt.Printf("  Items: %d\n", len(pi.Items))
-	fmt.Printf("  Webhook URL: %s\n", pi.webhookURL)
-	fmt.Printf("  Webhook Enabled: %v\n", pi.webhookURL != "")
-	fmt.Printf("  Pending Events: %d\n", len(pi.pendingEvents))
+	log.Infof("[INVENTORY] Queue opened: Player inventory sync queue (cluster change trigger)")
 }
 
 // OnJoin is called when a join operation is detected
@@ -155,7 +151,15 @@ func (pi *PlayerInventory) OnJoin() {
 	defer pi.eventMutex.Unlock()
 	
 	pi.lastJoinTime = time.Now()
-	log.Debugf("Inventory tracker notified of join operation at timestamp %v", pi.lastJoinTime)
+	
+	// Use appropriate prefix based on cluster change timing
+	timeSinceClusterChange := time.Since(pi.lastClusterChange)
+	prefix := "[INVENTORY]"
+	if timeSinceClusterChange <= 10*time.Second {
+		prefix = "[INVENTORY-OVERRIDE]"
+	}
+	
+	log.Debugf("%s Join operation detected at %v", prefix, pi.lastJoinTime)
 }
 
 // OnLeave is called when a leave event is detected
@@ -164,7 +168,15 @@ func (pi *PlayerInventory) OnLeave() {
 	defer pi.eventMutex.Unlock()
 	
 	pi.lastLeaveTime = time.Now()
-	log.Debugf("Inventory tracker notified of leave event at timestamp %v", pi.lastLeaveTime)
+	
+	// Use appropriate prefix based on cluster change timing
+	timeSinceClusterChange := time.Since(pi.lastClusterChange)
+	prefix := "[INVENTORY]"
+	if timeSinceClusterChange <= 10*time.Second {
+		prefix = "[INVENTORY-OVERRIDE]"
+	}
+	
+	log.Debugf("%s Leave event detected at %v", prefix, pi.lastLeaveTime)
 }
 
 // UpdateCharacterInfo updates the character information
@@ -175,9 +187,14 @@ func (pi *PlayerInventory) UpdateCharacterInfo(characterID, characterName string
 	pi.CharacterID = characterID
 	pi.CharacterName = characterName
 	
-	if pi.verboseOutput {
-		fmt.Printf("[Inventory] Character info updated: %s (%s)\n", characterName, characterID)
+	// Use appropriate prefix based on cluster change timing
+	timeSinceClusterChange := time.Since(pi.lastClusterChange)
+	prefix := "[INVENTORY]"
+	if timeSinceClusterChange <= 10*time.Second {
+		prefix = "[INVENTORY-OVERRIDE]"
 	}
+	
+	log.Infof("%s Character info updated: %s (%s)", prefix, characterName, characterID)
 }
 
 // queueWebhookEvent adds an event to the pending events queue and resets the timer
@@ -188,414 +205,182 @@ func (pi *PlayerInventory) queueWebhookEvent(action string, itemID int, quantity
 
 // sendBatchedEvents sends all pending events in a single webhook request
 func (pi *PlayerInventory) sendBatchedEvents() {
-	fmt.Printf("\n[WEBHOOK BATCH] ===== ATTEMPTING TO SEND BATCHED EVENTS =====\n")
-	log.Infof("[WEBHOOK BATCH] Starting batched events send with %d events", len(pi.pendingEvents))
+	pi.eventMutex.Lock()
+	defer pi.eventMutex.Unlock()
+	
+	// Determine if we're in override mode (within 10s of cluster change)
+	timeSinceClusterChange := time.Since(pi.lastClusterChange)
+	isOverride := timeSinceClusterChange <= 10*time.Second
+	prefix := "[INVENTORY]"
+	if isOverride {
+		prefix = "[INVENTORY-OVERRIDE]"
+	}
+	
+	log.Infof("%s Attempting to send batched events (%d events)", prefix, len(pi.pendingEvents))
 	
 	if pi.webhookURL == "" {
-		fmt.Printf("[WEBHOOK ERROR] Cannot send batched events: webhook URL is empty\n")
-		log.Error("[WEBHOOK ERROR] Cannot send batched events: webhook URL is empty")
-		fmt.Printf("[WEBHOOK BATCH] ===== END BATCHED EVENTS (FAILED) =====\n\n")
+		log.Error("%s Failed to send batch: webhook URL is empty", prefix)
 		return
 	}
 	
 	if len(pi.pendingEvents) == 0 {
-		fmt.Printf("[WEBHOOK ERROR] Cannot send batched events: no pending events\n")
-		log.Error("[WEBHOOK ERROR] Cannot send batched events: no pending events")
-		fmt.Printf("[WEBHOOK BATCH] ===== END BATCHED EVENTS (FAILED) =====\n\n")
+		log.Error("%s Failed to send batch: no pending events", prefix)
 		return
 	}
 
 	// Check if we're within 4 seconds of a cluster change
-	timeSinceClusterChange := time.Since(pi.lastClusterChange)
 	if timeSinceClusterChange <= 4*time.Second {
-		fmt.Printf("[WEBHOOK BATCH] Skipping batch send - too close to cluster change (%v)\n", timeSinceClusterChange)
-		log.Infof("[WEBHOOK BATCH] Skipping batch send - too close to cluster change (%v)", timeSinceClusterChange)
-		fmt.Printf("[WEBHOOK BATCH] ===== END BATCHED EVENTS (SKIPPED) =====\n\n")
+		log.Infof("%s Skipping batch send - too close to cluster change (%v)", prefix, timeSinceClusterChange)
+		
+		// Reset the timer to try again in 2 seconds
+		pi.batchTimer.Reset(2 * time.Second)
+		
 		return
 	}
 
-	// Check if it's been more than 3 seconds since the last bank access
-	// If so, automatically reset the bank state
-	if pi.isBank {
-		timeSinceBankAccess := time.Since(pi.lastBankAccess)
-		if timeSinceBankAccess > 3*time.Second {
-			fmt.Printf("[WEBHOOK BATCH] Auto-resetting bank state - it's been %v since last bank access\n", timeSinceBankAccess)
-			log.Infof("[WEBHOOK BATCH] Auto-resetting bank state - it's been %v since last bank access", timeSinceBankAccess)
-			pi.isBank = false
-			pi.currentBankLocation = ""
-		}
-	}
-
-	fmt.Printf("[WEBHOOK BATCH] Sending batch of %d events\n", len(pi.pendingEvents))
-	fmt.Printf("[WEBHOOK BATCH] Character: %s (%s)\n", pi.CharacterName, pi.CharacterID)
-	fmt.Printf("[WEBHOOK BATCH] Bank state: isBank=%v, location=%s\n", pi.isBank, pi.currentBankLocation)
-	
-	log.Infof("[WEBHOOK BATCH] Sending batch of %d events for character %s (%s)", 
-		len(pi.pendingEvents), pi.CharacterName, pi.CharacterID)
-	log.Infof("[WEBHOOK BATCH] Bank state: isBank=%v, location=%s", 
-		pi.isBank, pi.currentBankLocation)
-
-	// Check for equipment items in the batch
-	hasEquipmentItems := false
-	equippedItems := 0
+	// Filter out bank events - they should only be sent via SendBankItemsBatch
+	nonBankEvents := make([]WebhookEvent, 0)
 	for _, event := range pi.pendingEvents {
-		if event.SlotID >= 1000000 { // Equipment items typically have slot IDs over 1,000,000
-			hasEquipmentItems = true
-			if event.Equipped {
-				equippedItems++
-			}
+		if !event.IsBank {
+			nonBankEvents = append(nonBankEvents, event)
 		}
 	}
 	
-	if hasEquipmentItems {
-		fmt.Printf("[WEBHOOK BATCH] Batch includes %d equipment items (%d equipped, slots > 1,000,000)\n", 
-			countEquipmentItems(pi.pendingEvents), equippedItems)
-		log.Infof("[WEBHOOK BATCH] Batch includes %d equipment items (%d equipped)", 
-			countEquipmentItems(pi.pendingEvents), equippedItems)
-	} else {
-		fmt.Printf("[WEBHOOK BATCH] Batch contains only inventory items (no equipment)\n")
-		log.Infof("[WEBHOOK BATCH] Batch contains only inventory items (no equipment)")
+	// If there are no non-bank events, don't send anything
+	if len(nonBankEvents) == 0 {
+		log.Infof("%s No non-bank events to send in default queue", prefix)
+		return
 	}
 
+	log.Infof("%s Sending batch of %d events for character %s (%s)", 
+		prefix, len(nonBankEvents), pi.CharacterName, pi.CharacterID)
+	
 	// Determine if we should set override flag
-	// Use the time between cluster change and the last event added to the batch
-	timeBetweenClusterAndLastEvent := pi.lastEventTime.Sub(pi.lastClusterChange)
+	override := isOverride
 	
-	// Updated override logic: true if last event occurred within 4 sec of cluster change, false otherwise
-	override := timeBetweenClusterAndLastEvent <= 4*time.Second
-	
-	if override {
-		fmt.Printf("[WEBHOOK BATCH] Override=true: Last event occurred within 4s of cluster change (%v after)\n", 
-			timeBetweenClusterAndLastEvent)
-		log.Infof("[WEBHOOK BATCH] Override=true: Last event occurred within 4s of cluster change (%v after)", 
-			timeBetweenClusterAndLastEvent)
-	} else {
-		fmt.Printf("[WEBHOOK BATCH] Override=false: Last event occurred more than 4s after cluster change (%v after)\n", 
-			timeBetweenClusterAndLastEvent)
-		log.Infof("[WEBHOOK BATCH] Override=false: Last event occurred more than 4s after cluster change (%v after)", 
-			timeBetweenClusterAndLastEvent)
-	}
+	log.Infof("%s Batch details: Override=%v, Bank=false, LocationID=0", prefix, override)
 
 	payload := WebhookPayload{
-		Events:         pi.pendingEvents,
+		Events:         nonBankEvents,
 		CharacterID:    pi.CharacterID,
 		CharacterName:  pi.CharacterName,
 		BatchTimestamp: time.Now().Unix(),
 		Override:       override,
-		Bank:           pi.isBank,
+		Bank:           false,
 	}
-
-	if pi.isBank && pi.currentBankLocation != "" {
-		fmt.Printf("[WEBHOOK BATCH] Including location ID in events: %s\n", pi.currentBankLocation)
-		log.Infof("[WEBHOOK BATCH] Including location ID in events: %s", pi.currentBankLocation)
-		
-		// Update the location ID in each event
-		for i := range pi.pendingEvents {
-			if pi.pendingEvents[i].LocationID == "" {
-				// If this is not a tab content event (currentBankLocation is not a number 1-5), use "0"
-				if !isValidTabContentLocationID(pi.currentBankLocation) {
-					pi.pendingEvents[i].LocationID = "0"
-				} else {
-					pi.pendingEvents[i].LocationID = pi.currentBankLocation
-				}
-			}
-		}
-	} else {
-		// If not in a bank, ensure all events have locationId = "0"
-		for i := range pi.pendingEvents {
-			if pi.pendingEvents[i].LocationID == "" {
-				pi.pendingEvents[i].LocationID = "0"
-			}
-		}
-	}
-
-	// Don't print the full payload to reduce log verbosity
-	fmt.Printf("[WEBHOOK PAYLOAD] Batched events payload contains %d events (not shown to reduce verbosity)\n", len(pi.pendingEvents))
-	log.Debugf("[WEBHOOK PAYLOAD] Batched events payload contains %d events", len(pi.pendingEvents))
 
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
-		log.Errorf("Failed to marshal batched webhook payload: %v", err)
-		fmt.Printf("[WEBHOOK ERROR] Failed to marshal batched webhook payload: %v\n", err)
-		fmt.Printf("[WEBHOOK BATCH] ===== END BATCHED EVENTS (FAILED) =====\n\n")
-		
-		// Increment retry counter and check if we should keep retrying
-		pi.webhookRetryCount++
-		if pi.webhookRetryCount > 3 {
-			log.Warnf("[WEBHOOK RETRY] Exceeded maximum retry count (%d), clearing %d pending events", 
-				pi.webhookRetryCount, len(pi.pendingEvents))
-			fmt.Printf("[WEBHOOK RETRY] Exceeded maximum retry count (%d), clearing %d pending events\n", 
-				pi.webhookRetryCount, len(pi.pendingEvents))
-			pi.pendingEvents = nil
-			pi.webhookRetryCount = 0
-		} else {
-			// Log that we're keeping the events in the queue for retry
-			log.Infof("[WEBHOOK RETRY] Keeping %d events in queue for retry after timeout error (attempt %d/3)", 
-				len(pi.pendingEvents), pi.webhookRetryCount)
-			fmt.Printf("[WEBHOOK RETRY] Keeping %d events in queue for retry after timeout error (attempt %d/3)\n", 
-				len(pi.pendingEvents), pi.webhookRetryCount)
-		}
-		
+		log.Errorf("%s Failed to marshal webhook payload: %v", prefix, err)
 		return
 	}
-
-	fmt.Printf("[WEBHOOK REQUEST] Sending POST request to: %s\n", pi.webhookURL)
-	log.Infof("[WEBHOOK REQUEST] Sending POST request to: %s with %d bytes", pi.webhookURL, len(jsonPayload))
 	
-	// Create a custom HTTP client with timeout
+	// Create a new HTTP client with a timeout
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 	
-	// Create the request
+	// Create a new request
 	req, err := http.NewRequest("POST", pi.webhookURL, bytes.NewBuffer(jsonPayload))
 	if err != nil {
-		log.Errorf("Failed to create request for batched events: %v", err)
-		fmt.Printf("[WEBHOOK ERROR] Failed to create request for batched events: %v\n", err)
-		fmt.Printf("[WEBHOOK BATCH] ===== END BATCHED EVENTS (FAILED) =====\n\n")
+		log.Errorf("%s Failed to create webhook request: %v", prefix, err)
 		return
 	}
 	
-	// Set headers
+	// Set the content type header
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "AlbionData-Client")
+	
+	// Add a timestamp header for debugging
+	req.Header.Set("X-Albion-Inventory-Timestamp", fmt.Sprintf("%d", time.Now().Unix()))
+	
+	// Add a batch ID header for tracking
+	batchID := fmt.Sprintf("%d-%d", time.Now().Unix(), len(nonBankEvents))
+	req.Header.Set("X-Albion-Inventory-Batch-ID", batchID)
+	
+	// Record the start time for timing
+	startTime := time.Now()
 	
 	// Send the request
-	startTime := time.Now()
+	log.Infof("%s Sending webhook request to %s", prefix, pi.webhookURL)
+	
 	resp, err := client.Do(req)
 	requestDuration := time.Since(startTime)
 	
 	if err != nil {
-		log.Errorf("Failed to send batched webhook: %v", err)
-		fmt.Printf("[WEBHOOK ERROR] Failed to send batched webhook: %v\n", err)
-		fmt.Printf("[WEBHOOK BATCH] ===== END BATCHED EVENTS (FAILED) =====\n\n")
+		log.Errorf("%s Failed to send webhook: %v", prefix, err)
 		
 		// Increment retry counter and check if we should keep retrying
 		pi.webhookRetryCount++
 		if pi.webhookRetryCount > 3 {
-			log.Warnf("[WEBHOOK RETRY] Exceeded maximum retry count (%d), clearing %d pending events", 
-				pi.webhookRetryCount, len(pi.pendingEvents))
-			fmt.Printf("[WEBHOOK RETRY] Exceeded maximum retry count (%d), clearing %d pending events\n", 
-				pi.webhookRetryCount, len(pi.pendingEvents))
-			pi.pendingEvents = nil
+			log.Warnf("%s Exceeded maximum retry count (%d), clearing %d pending events", 
+				prefix, pi.webhookRetryCount, len(nonBankEvents))
+			// Only remove non-bank events
+			pi.removeNonBankEvents()
 			pi.webhookRetryCount = 0
 		} else {
 			// Log that we're keeping the events in the queue for retry
-			log.Infof("[WEBHOOK RETRY] Keeping %d events in queue for retry after timeout error (attempt %d/3)", 
-				len(pi.pendingEvents), pi.webhookRetryCount)
-			fmt.Printf("[WEBHOOK RETRY] Keeping %d events in queue for retry after timeout error (attempt %d/3)\n", 
-				len(pi.pendingEvents), pi.webhookRetryCount)
+			log.Infof("%s Keeping %d events in queue for retry after error (attempt %d/3)", 
+				prefix, len(nonBankEvents), pi.webhookRetryCount)
 		}
 		
 		return
 	}
 	defer resp.Body.Close()
 
-	// Read and print the response body
-	respBody, err := io.ReadAll(resp.Body)
+	// Read the response body
+	_, err = io.ReadAll(resp.Body)
 	if err != nil {
-		log.Errorf("Failed to read response body: %v", err)
-		fmt.Printf("[WEBHOOK ERROR] Failed to read response body: %v\n", err)
+		log.Errorf("%s Failed to read response body: %v", prefix, err)
 	}
 	
 	// Log request timing
-	fmt.Printf("[WEBHOOK TIMING] Request completed in %v\n", requestDuration)
-	log.Infof("[WEBHOOK TIMING] Request completed in %v", requestDuration)
+	log.Infof("%s Request completed in %v", prefix, requestDuration)
 	
 	// Check response status
 	if resp.StatusCode >= 400 {
-		log.Errorf("Batched webhook returned error status: %d", resp.StatusCode)
-		fmt.Printf("[WEBHOOK ERROR] Batched webhook returned error status: %d\n", resp.StatusCode)
-		fmt.Printf("[WEBHOOK RESPONSE] Error response body: %s\n", string(respBody))
-		log.Errorf("[WEBHOOK RESPONSE] Error response body: %s", string(respBody))
-		fmt.Printf("[WEBHOOK BATCH] ===== END BATCHED EVENTS (FAILED) =====\n\n")
-	} else {
-		fmt.Printf("[WEBHOOK SUCCESS] Successfully sent batch of %d events\n", len(pi.pendingEvents))
-		fmt.Printf("[WEBHOOK RESPONSE] Response status: %d\n", resp.StatusCode)
-		// Don't print the full response body to reduce log verbosity
-		fmt.Printf("[WEBHOOK RESPONSE] Response received (not shown to reduce verbosity)\n")
-		log.Infof("[WEBHOOK SUCCESS] Successfully sent batch of %d events", len(pi.pendingEvents))
-		log.Debugf("[WEBHOOK RESPONSE] Response status: %d, body: %s", resp.StatusCode, string(respBody))
-		fmt.Printf("[WEBHOOK BATCH] ===== END BATCHED EVENTS (SUCCESS) =====\n\n")
-	}
-
-	// Clear pending events after send
-	pi.pendingEvents = nil
-	log.Infof("[WEBHOOK BATCH] Cleared pending events queue after sending batch")
-
-	// Reset retry counter on success
-	pi.webhookRetryCount = 0
-}
-
-// countEquipmentItems counts the number of equipment items in a slice of WebhookEvents
-func countEquipmentItems(events []WebhookEvent) int {
-	count := 0
-	for _, event := range events {
-		if event.SlotID >= 1000000 { // Equipment items typically have slot IDs over 1,000,000
-			count++
-		}
-	}
-	return count
-}
-
-// AddOrUpdateItem adds or updates an item in the inventory
-func (pi *PlayerInventory) AddOrUpdateItem(itemID int, quantity int, slotID int) {
-	// Call the new method with default values for bank information
-	pi.AddOrUpdateItemWithBank(itemID, quantity, slotID, false, "")
-}
-
-// RemoveItem removes an item from the inventory
-func (pi *PlayerInventory) RemoveItem(itemID int) {
-	// Call the new method with default values for bank information
-	pi.RemoveItemWithBank(itemID, false, "")
-}
-
-// RemoveItemWithBank removes an item from the inventory with bank information
-func (pi *PlayerInventory) RemoveItemWithBank(itemID int, isBank bool, locationID string) {
-	pi.mutex.Lock()
-	defer pi.mutex.Unlock()
-
-	var oldQuantity int
-	var slotID int
-	if item, exists := pi.Items[itemID]; exists {
-		if pi.verboseOutput {
-			// Calculate delta (always negative for removals)
-			delta := -item.Quantity
-			
-			// Create message
-			removeMsg := fmt.Sprintf("[Inventory] Removed item: ID=%d, Quantity was %d (Delta: %d)", 
-				itemID, item.Quantity, delta)
-			
-			// Add bank information if applicable
-			if isBank {
-				removeMsg += fmt.Sprintf(" [Bank: %s]", locationID)
-			}
-			
-			fmt.Println(removeMsg)
-		}
-		oldQuantity = item.Quantity
-		slotID = item.SlotID
+		log.Errorf("%s Webhook returned error status: %d", prefix, resp.StatusCode)
 		
-		// Queue webhook update
-		if pi.webhookURL != "" {
-			pi.queueWebhookEventWithBank("Removed", itemID, 0, oldQuantity, slotID, isBank, locationID)
-		}
-	}
-
-	delete(pi.Items, itemID)
-	pi.LastUpdated = time.Now().Unix()
-	
-	// Only save to file if an output path is provided
-	if pi.outputPath != "" {
-		pi.SaveToFile()
-	}
-}
-
-// SetVerboseOutput sets whether to print verbose output
-func (pi *PlayerInventory) SetVerboseOutput(verbose bool) {
-	pi.mutex.Lock()
-	defer pi.mutex.Unlock()
-	pi.verboseOutput = verbose
-}
-
-// SaveToFile saves the inventory to a JSON file
-func (pi *PlayerInventory) SaveToFile() {
-	if pi.outputPath == "" {
-		return
-	}
-
-	// Create directory if it doesn't exist
-	dir := filepath.Dir(pi.outputPath)
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			log.Errorf("Failed to create directory for inventory file: %v", err)
-			return
-		}
-	}
-
-	data, err := json.MarshalIndent(pi, "", "  ")
-	if err != nil {
-		log.Errorf("Failed to marshal inventory data: %v", err)
-		return
-	}
-
-	err = os.WriteFile(pi.outputPath, data, 0644)
-	if err != nil {
-		log.Errorf("Failed to write inventory file: %v", err)
-		return
-	}
-
-	if pi.verboseOutput {
-		log.Debugf("Saved inventory to %s", pi.outputPath)
-	}
-}
-
-// AddOrUpdateItemWithBank adds or updates an item in the inventory with bank information
-func (pi *PlayerInventory) AddOrUpdateItemWithBank(itemID int, quantity int, slotID int, isBank bool, locationID string) {
-	pi.mutex.Lock()
-	defer pi.mutex.Unlock()
-
-	now := time.Now().Unix()
-	var action string
-	var oldQuantity int
-	
-	// Handle negative quantities (likely due to byte overflow in the game client)
-	originalQuantity := quantity
-	if quantity < 0 {
-		if quantity >= -127 {
-			// For values between -1 and -127, add 256 to get the actual quantity
-			// This is similar to how the auction code handles negative item amounts
-			quantity = 256 + quantity
-			log.Debugf("Converting negative quantity %d to %d for item %d (likely a stack overflow)", 
-				originalQuantity, quantity, itemID)
+		// Increment retry counter and check if we should keep retrying
+		pi.webhookRetryCount++
+		if pi.webhookRetryCount > 3 {
+			log.Warnf("%s Exceeded maximum retry count (%d), clearing %d pending events", 
+				prefix, pi.webhookRetryCount, len(nonBankEvents))
+			// Only remove non-bank events
+			pi.removeNonBankEvents()
+			pi.webhookRetryCount = 0
 		} else {
-			// For very negative values, we're not sure how to interpret them
-			// Log a warning but keep the original value
-			log.Warnf("Received very negative quantity %d for item %d, keeping as is", 
-				quantity, itemID)
+			// Log that we're keeping the events in the queue for retry
+			log.Infof("%s Keeping %d events in queue for retry after HTTP error (attempt %d/3)", 
+				prefix, len(nonBankEvents), pi.webhookRetryCount)
 		}
-	}
-
-	if item, exists := pi.Items[itemID]; exists {
-		oldQuantity = item.Quantity
-		action = "Updated"
-		item.Quantity = quantity
-		item.SlotID = slotID
-		item.LastSeen = now
 	} else {
-		oldQuantity = 0
-		action = "Added"
-		pi.Items[itemID] = &InventoryItem{
-			ItemID:   itemID,
-			Quantity: quantity,
-			SlotID:   slotID,
-			LastSeen: now,
-		}
-	}
-
-	pi.LastUpdated = now
-	
-	// Queue webhook update
-	if pi.webhookURL != "" {
-		// For webhook, we'll send the corrected quantity but include the original in the debug message
-		if originalQuantity < 0 && quantity != originalQuantity {
-			log.Debugf("Converting negative quantity %d to %d for item %d", 
-				originalQuantity, quantity, itemID)
-		}
+		log.Infof("%s Webhook request successful: status %d", prefix, resp.StatusCode)
 		
-		// Queue the webhook event - no longer checking for bank vault events
-		pi.queueWebhookEventWithBank(action, itemID, quantity, oldQuantity, slotID, isBank, locationID)
-	}
-	
-	// Only save to file if an output path is provided
-	if pi.outputPath != "" {
-		pi.SaveToFile()
+		// Remove non-bank events after successful send
+		pi.removeNonBankEvents()
+		
+		// Reset retry counter on success
+		pi.webhookRetryCount = 0
+		
+		log.Infof("%s Queue cleared: Default inventory queue (batch sent successfully)", prefix)
 	}
 }
 
+// removeNonBankEvents removes all non-bank events from the pending events queue
+func (pi *PlayerInventory) removeNonBankEvents() {
+	bankEvents := make([]WebhookEvent, 0)
+	for _, event := range pi.pendingEvents {
+		if event.IsBank {
+			bankEvents = append(bankEvents, event)
+		}
+	}
+	pi.pendingEvents = bankEvents
+}
+
+// queueWebhookEventWithBank adds an event to the pending events queue with bank information
 func (pi *PlayerInventory) queueWebhookEventWithBank(action string, itemID int, quantity int, oldQuantity int, slotID int, isBank bool, locationID string) {
 	if pi.webhookURL == "" {
-		fmt.Printf("[WEBHOOK ERROR] Cannot queue webhook event: webhook URL is empty\n")
+		log.Error("[INVENTORY] Cannot queue webhook event: webhook URL is empty")
 		return
 	}
 
@@ -607,13 +392,20 @@ func (pi *PlayerInventory) queueWebhookEventWithBank(action string, itemID int, 
 		locationID = "0"
 	}
 	
-	// Log the event being queued
+	// Log the event being queued with appropriate prefix
 	if isBank {
-		fmt.Printf("[WEBHOOK QUEUE] Queueing BANK event: Action=%s, ItemID=%d, Quantity=%d, Delta=%d, SlotID=%d, LocationID=%s\n",
-			action, itemID, quantity, delta, slotID, locationID)
+		log.Infof("[BANK-OVERRIDE] Adding to queue: Item=%d, Action=%s, Quantity=%d, Delta=%d, LocationID=%s", 
+			itemID, action, quantity, delta, locationID)
 	} else {
-		fmt.Printf("[WEBHOOK QUEUE] Queueing event: Action=%s, ItemID=%d, Quantity=%d, Delta=%d, SlotID=%d\n",
-			action, itemID, quantity, delta, slotID)
+		// Check if we're within 10 seconds of cluster change for prefix
+		timeSinceClusterChange := time.Since(pi.lastClusterChange)
+		if timeSinceClusterChange <= 10*time.Second {
+			log.Infof("[INVENTORY-OVERRIDE] Adding to queue: Item=%d, Action=%s, Quantity=%d, Delta=%d", 
+				itemID, action, quantity, delta)
+		} else {
+			log.Infof("[INVENTORY] Adding to queue: Item=%d, Action=%s, Quantity=%d, Delta=%d", 
+				itemID, action, quantity, delta)
+		}
 	}
 
 	event := WebhookEvent{
@@ -625,6 +417,7 @@ func (pi *PlayerInventory) queueWebhookEventWithBank(action string, itemID int, 
 		Equipped:   false,
 		Timestamp:  time.Now().Unix(),
 		LocationID: locationID,
+		IsBank:     isBank, // Store whether this is a bank event
 	}
 
 	// Add the event to the queue
@@ -633,8 +426,6 @@ func (pi *PlayerInventory) queueWebhookEventWithBank(action string, itemID int, 
 	
 	pi.pendingEvents = append(pi.pendingEvents, event)
 	pi.lastEventTime = time.Now() // Track when the last event was added
-	
-	fmt.Printf("[WEBHOOK QUEUE] Added event to queue. Queue size now: %d events\n", len(pi.pendingEvents))
 	
 	// Only set the regular batch timer for non-bank events
 	// Bank events should only be sent via the explicit SendBankItemsBatch call
@@ -645,18 +436,16 @@ func (pi *PlayerInventory) queueWebhookEventWithBank(action string, itemID int, 
 		timeSinceClusterChange := time.Since(pi.lastClusterChange)
 		if timeSinceClusterChange <= 10*time.Second {
 			waitTime = 2 * time.Second
-			fmt.Printf("[WEBHOOK TIMER] Setting batch timer to 2s (within 10s of cluster change)\n")
+			log.Infof("[INVENTORY-OVERRIDE] Setting batch timer: 2s (within 10s of cluster change)")
 		} else {
 			waitTime = 10 * time.Second
-			fmt.Printf("[WEBHOOK TIMER] Setting batch timer to 10s (normal operation)\n")
+			log.Infof("[INVENTORY] Setting batch timer: 10s (normal operation)")
 		}
 		
 		// Reset the timer with the appropriate wait time
 		oldTimerActive := pi.batchTimer.Stop()
 		pi.batchTimer.Reset(waitTime)
-		fmt.Printf("[WEBHOOK TIMER] Timer reset: waitTime=%v, oldTimerActive=%v\n", waitTime, oldTimerActive)
-	} else {
-		fmt.Printf("[WEBHOOK TIMER] Not resetting timer for bank event - will be sent by explicit bank batch\n")
+		log.Debugf("[INVENTORY] Timer reset: waitTime=%v, oldTimerActive=%v", waitTime, oldTimerActive)
 	}
 }
 
@@ -700,23 +489,23 @@ func (pi *PlayerInventory) sendWebhookUpdate(action string, itemID int, quantity
 
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
-		log.Errorf("Failed to marshal webhook payload: %v", err)
+		log.Errorf("[INVENTORY] Failed to marshal webhook payload: %v", err)
 		return
 	}
 	
 	// Send the payload to the webhook URL
 	resp, err := http.Post(pi.webhookURL, "application/json", bytes.NewBuffer(jsonPayload))
 	if err != nil {
-		log.Errorf("Failed to send webhook: %v", err)
+		log.Errorf("[INVENTORY] Failed to send webhook: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	// Check response status
 	if resp.StatusCode >= 400 {
-		log.Errorf("Webhook returned error status: %d", resp.StatusCode)
+		log.Errorf("[INVENTORY] Webhook returned error status: %d", resp.StatusCode)
 	} else {
-		fmt.Printf("[WEBHOOK] Successfully sent single item update for ID=%d\n", itemID)
+		log.Infof("[INVENTORY] Single item update sent successfully: Item=%d, Status=%d", itemID, resp.StatusCode)
 	}
 }
 
@@ -730,66 +519,35 @@ func (pi *PlayerInventory) NotifyBankVaultAccess(locationID string) {
 	
 	// Validate that this is a bank operation with a valid location ID
 	if !isValidTabContentLocationID(locationID) {
-		log.Warnf("[BANK ACCESS] Attempted to notify bank access with invalid location ID: %s", locationID)
-		fmt.Printf("[BANK ACCESS] Attempted to notify bank access with invalid location ID: %s\n", locationID)
+		log.Warnf("[BANK-OVERRIDE] Invalid bank location ID: %s", locationID)
 		return
 	}
 	
-	// Store previous state for logging
-	prevIsBank := pi.isBank
-	prevLocation := pi.currentBankLocation
-	
-	// Update state
 	pi.lastBankAccess = time.Now()
-	pi.currentBankLocation = locationID
 	pi.isBank = true
+	pi.currentBankLocation = locationID
 	
-	fmt.Printf("\n[BANK ACCESS] ===== DETECTED BANK VAULT ACCESS =====\n")
-	fmt.Printf("[BANK ACCESS] Location ID: %s\n", locationID)
-	fmt.Printf("[BANK ACCESS] Timestamp: %v\n", pi.lastBankAccess)
-	fmt.Printf("[BANK ACCESS] Previous bank state: isBank=%v, location=%s\n", 
-		prevIsBank, prevLocation)
-	fmt.Printf("[BANK ACCESS] Webhook URL: %s\n", pi.webhookURL)
-	fmt.Printf("[BANK ACCESS] Webhook Enabled: %v\n", pi.webhookURL != "")
-	fmt.Printf("[BANK ACCESS] Pending Events: %d\n", len(pi.pendingEvents))
-	fmt.Printf("[BANK ACCESS] NOTE: This method only updates state and does NOT trigger bank queues\n")
-	fmt.Printf("[BANK ACCESS] ===== END BANK VAULT ACCESS =====\n\n")
-	
-	log.Infof("[BANK ACCESS] Bank vault access detected - Location ID: %s, Previous: isBank=%v, location=%s", 
-		locationID, prevIsBank, prevLocation)
-	log.Infof("[BANK ACCESS] NOTE: Bank vault access only updates state and does NOT trigger bank queues")
+	log.Infof("[BANK-OVERRIDE] Bank access detected: LocationID=%s", locationID)
 }
 
-// NotifyLeaveBankVault updates the state when leaving a bank vault
-func (pi *PlayerInventory) NotifyLeaveBankVault() {
-	pi.eventMutex.Lock()
-	defer pi.eventMutex.Unlock()
-	
-	pi.isBank = false
-	pi.currentBankLocation = ""
-	log.Infof("Inventory tracker notified of leaving bank vault at timestamp %v", time.Now())
-}
-
-// PrintDebugState prints the current state of the inventory tracker for debugging
+// PrintDebugState prints the current state of the inventory tracker
 func (pi *PlayerInventory) PrintDebugState() {
 	pi.mutex.Lock()
 	defer pi.mutex.Unlock()
 	
-	fmt.Printf("\n[DEBUG] Inventory Tracker State:\n")
-	fmt.Printf("  Character: %s (%s)\n", pi.CharacterName, pi.CharacterID)
-	fmt.Printf("  Items: %d\n", len(pi.Items))
-	fmt.Printf("  Last Updated: %v\n", time.Unix(pi.LastUpdated, 0))
-	fmt.Printf("  Webhook URL: %s\n", pi.webhookURL)
-	fmt.Printf("  Webhook Enabled: %v\n", pi.webhookURL != "")
-	fmt.Printf("  Pending Events: %d\n", len(pi.pendingEvents))
-	fmt.Printf("  Last Cluster Change: %v (%v ago)\n", pi.lastClusterChange, time.Since(pi.lastClusterChange))
-	fmt.Printf("  Last Join Time: %v (%v ago)\n", pi.lastJoinTime, time.Since(pi.lastJoinTime))
-	fmt.Printf("  Last Leave Time: %v (%v ago)\n", pi.lastLeaveTime, time.Since(pi.lastLeaveTime))
-	fmt.Printf("  Last Bank Access: %v (%v ago)\n", pi.lastBankAccess, time.Since(pi.lastBankAccess))
-	fmt.Printf("  Is Bank: %v\n", pi.isBank)
-	if pi.isBank {
-		fmt.Printf("  Current Bank Location: %s\n", pi.currentBankLocation)
+	// Use appropriate prefix based on cluster change timing
+	timeSinceClusterChange := time.Since(pi.lastClusterChange)
+	prefix := "[INVENTORY]"
+	if timeSinceClusterChange <= 10*time.Second {
+		prefix = "[INVENTORY-OVERRIDE]"
 	}
+	
+	log.Infof("%s State: Character=%s, Items=%d, PendingEvents=%d", 
+		prefix, pi.CharacterName, len(pi.Items), len(pi.pendingEvents))
+	log.Debugf("%s Last cluster change: %v (%v ago)", 
+		prefix, pi.lastClusterChange, time.Since(pi.lastClusterChange))
+	log.Debugf("%s Bank state: IsBank=%v, LocationID=%s, LastAccess=%v (%v ago)", 
+		prefix, pi.isBank, pi.currentBankLocation, pi.lastBankAccess, time.Since(pi.lastBankAccess))
 }
 
 // NotifyClusterChange updates the cluster change timestamp
@@ -798,71 +556,10 @@ func (pi *PlayerInventory) NotifyClusterChange() {
 	defer pi.eventMutex.Unlock()
 	
 	pi.lastClusterChange = time.Now()
-	fmt.Printf("[CLUSTER] Changed at %v\n", pi.lastClusterChange)
+	log.Infof("[INVENTORY-OVERRIDE] Queue opened: Player inventory sync queue (cluster change trigger)")
 	
 	// Print debug state after cluster change
 	pi.PrintDebugState()
-}
-
-// AddOrUpdateEquipmentItem adds or updates an equipment item in the inventory
-func (pi *PlayerInventory) AddOrUpdateEquipmentItem(itemID int, quantity int, slotID int, equipped bool, isBank bool, locationID string) {
-	pi.mutex.Lock()
-	defer pi.mutex.Unlock()
-
-	now := time.Now().Unix()
-	var action string
-	var oldQuantity int
-	
-	// Handle negative quantities (likely due to byte overflow in the game client)
-	originalQuantity := quantity
-	if quantity < 0 {
-		if quantity >= -127 {
-			// For values between -1 and -127, add 256 to get the actual quantity
-			// This is similar to how the auction code handles negative item amounts
-			quantity = 256 + quantity
-			log.Debugf("Converting negative quantity %d to %d for item %d (likely a stack overflow)", 
-				originalQuantity, quantity, itemID)
-		} else {
-			// For very negative values, we're not sure how to interpret them
-			// Log a warning but keep the original value
-			log.Warnf("Received very negative quantity %d for item %d, keeping as is", 
-				quantity, itemID)
-		}
-	}
-
-	if item, exists := pi.Items[itemID]; exists {
-		oldQuantity = item.Quantity
-		action = "Updated"
-		item.Quantity = quantity
-		item.SlotID = slotID
-		item.LastSeen = now
-	} else {
-		oldQuantity = 0
-		action = "Added"
-		pi.Items[itemID] = &InventoryItem{
-			ItemID:   itemID,
-			Quantity: quantity,
-			SlotID:   slotID,
-			LastSeen: now,
-		}
-	}
-
-	pi.LastUpdated = now
-	
-	// Queue webhook update with equipped information
-	if pi.webhookURL != "" {
-		// For webhook, we'll send the corrected quantity but include the original in the debug message
-		if originalQuantity < 0 && quantity != originalQuantity {
-			log.Debugf("Converting negative quantity %d to %d for item %d", 
-				originalQuantity, quantity, itemID)
-		}
-		pi.queueWebhookEventWithEquipped(action, itemID, quantity, oldQuantity, slotID, equipped, isBank, locationID)
-	}
-	
-	// Only save to file if an output path is provided
-	if pi.outputPath != "" {
-		pi.SaveToFile()
-	}
 }
 
 // queueWebhookEventWithEquipped adds an event to the pending events queue with equipped information
@@ -901,12 +598,18 @@ func (pi *PlayerInventory) queueWebhookEventWithEquipped(action string, itemID i
 	// Otherwise, use the standard 10 second timer
 	var waitTime time.Duration
 	timeSinceClusterChange := time.Since(pi.lastClusterChange)
+	isOverride := timeSinceClusterChange <= 10*time.Second
+	prefix := "[INVENTORY]"
+	if isOverride {
+		prefix = "[INVENTORY-OVERRIDE]"
+	}
+	
 	if timeSinceClusterChange <= 10*time.Second {
 		waitTime = 2 * time.Second
-		fmt.Printf("[WEBHOOK] Batch size: %d events (waiting 2s for more events - after cluster change)\n", len(pi.pendingEvents))
+		log.Infof("%s Queue update: %d events (2s timer - after cluster change)", prefix, len(pi.pendingEvents))
 	} else {
 		waitTime = 10 * time.Second
-		fmt.Printf("[WEBHOOK] Batch size: %d events (waiting 10s for more events)\n", len(pi.pendingEvents))
+		log.Infof("%s Queue update: %d events (10s timer - normal operation)", prefix, len(pi.pendingEvents))
 	}
 	
 	// Reset the timer with the appropriate wait time
@@ -918,8 +621,8 @@ func (pi *PlayerInventory) AddOrUpdateBankItem(itemID int, quantity int, slotID 
 	pi.mutex.Lock()
 	defer pi.mutex.Unlock()
 
-	fmt.Printf("[BANK ITEM] Adding/updating bank item: ID=%d, Quantity=%d, SlotID=%d, Tab=%s, Location=%s\n", 
-		itemID, quantity, slotID, tabName, locationID)
+	log.Infof("[BANK-OVERRIDE] Processing bank item: ID=%d, Quantity=%d, Tab=%s, LocationID=%s", 
+		itemID, quantity, tabName, locationID)
 
 	now := time.Now().Unix()
 	var action string
@@ -928,7 +631,7 @@ func (pi *PlayerInventory) AddOrUpdateBankItem(itemID int, quantity int, slotID 
 	if item, exists := pi.Items[itemID]; exists {
 		oldQuantity = item.Quantity
 		action = "Updated"
-		fmt.Printf("[BANK ITEM] Updating existing item: ID=%d, Old Quantity=%d, New Quantity=%d, Delta=%d\n", 
+		log.Debugf("[BANK-OVERRIDE] Updating bank item: ID=%d, Old=%d, New=%d, Delta=%d", 
 			itemID, oldQuantity, quantity, quantity-oldQuantity)
 		item.Quantity = quantity
 		item.SlotID = slotID
@@ -936,7 +639,7 @@ func (pi *PlayerInventory) AddOrUpdateBankItem(itemID int, quantity int, slotID 
 	} else {
 		oldQuantity = 0
 		action = "Added"
-		fmt.Printf("[BANK ITEM] Adding new item: ID=%d, Quantity=%d\n", itemID, quantity)
+		log.Debugf("[BANK-OVERRIDE] Adding new bank item: ID=%d, Quantity=%d", itemID, quantity)
 		pi.Items[itemID] = &InventoryItem{
 			ItemID:   itemID,
 			Quantity: quantity,
@@ -950,258 +653,343 @@ func (pi *PlayerInventory) AddOrUpdateBankItem(itemID int, quantity int, slotID 
 	// Queue webhook update with bank information
 	// Note: Bank items are always sent with override=true in the final webhook payload
 	if pi.webhookURL != "" {
-		fmt.Printf("[BANK ITEM] Queueing webhook event for item ID=%d, Action=%s, LocationID=%s\n", itemID, action, locationID)
 		pi.queueWebhookEventWithBank(action, itemID, quantity, oldQuantity, slotID, true, locationID)
-	} else {
-		fmt.Printf("[BANK ITEM] Webhook URL is empty, not queueing event for item ID=%d\n", itemID)
 	}
 	
 	// Only save to file if an output path is provided
 	if pi.outputPath != "" {
 		pi.SaveToFile()
-		fmt.Printf("[BANK ITEM] Saved inventory to file: %s\n", pi.outputPath)
-	} else {
-		fmt.Printf("[BANK ITEM] Output path is empty, not saving to file\n")
 	}
 }
 
-// SendBankItemsBatch sends a batch update with all bank items
-// This should ONLY be called from operationAssetOverviewTabContent.Process or via SetBankBatchTimer
-func (pi *PlayerInventory) SendBankItemsBatch(tabName string, locationID string) {
-	// Validate that this is a bank operation with a valid location ID
-	if !isValidTabContentLocationID(locationID) {
-		log.Warnf("[WEBHOOK BANK BATCH] Attempted to send bank batch with invalid location ID: %s", locationID)
-		fmt.Printf("[WEBHOOK BANK BATCH] Attempted to send bank batch with invalid location ID: %s\n", locationID)
+// SaveToFile saves the inventory to a JSON file
+func (pi *PlayerInventory) SaveToFile() {
+	if pi.outputPath == "" {
 		return
 	}
 
-	fmt.Printf("\n[WEBHOOK BANK BATCH] ===== ATTEMPTING TO SEND BANK ITEMS BATCH =====\n")
-	log.Infof("[WEBHOOK BANK BATCH] Starting bank items batch send for tab: %s, location: %s", tabName, locationID)
-	
-	if pi.webhookURL == "" {
-		fmt.Printf("[WEBHOOK ERROR] Cannot send bank items batch: webhook URL is empty\n")
-		log.Error("[WEBHOOK ERROR] Cannot send bank items batch: webhook URL is empty")
-		fmt.Printf("[WEBHOOK BANK BATCH] ===== END BANK ITEMS BATCH (FAILED) =====\n\n")
-		return
+	// Create directory if it doesn't exist
+	dir := filepath.Dir(pi.outputPath)
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			log.Errorf("[INVENTORY] Failed to create directory for inventory file: %v", err)
+			return
+		}
 	}
-	
-	if len(pi.pendingEvents) == 0 {
-		fmt.Printf("[WEBHOOK ERROR] Cannot send bank items batch: no pending events\n")
-		log.Error("[WEBHOOK ERROR] Cannot send bank items batch: no pending events")
-		fmt.Printf("[WEBHOOK BANK BATCH] ===== END BANK ITEMS BATCH (FAILED) =====\n\n")
+
+	data, err := json.MarshalIndent(pi, "", "  ")
+	if err != nil {
+		log.Errorf("[INVENTORY] Failed to marshal inventory data: %v", err)
 		return
 	}
 
-	fmt.Printf("[WEBHOOK BANK BATCH] Sending batch of %d bank items from tab: %s\n", len(pi.pendingEvents), tabName)
-	log.Infof("[WEBHOOK BANK BATCH] Sending batch of %d bank items from tab: %s", len(pi.pendingEvents), tabName)
+	err = os.WriteFile(pi.outputPath, data, 0644)
+	if err != nil {
+		log.Errorf("[INVENTORY] Failed to write inventory file: %v", err)
+		return
+	}
 
-	// Check for equipment items in the batch
-	hasEquipmentItems := false
-	equippedItems := 0
+	log.Debugf("[INVENTORY] Saved inventory to %s", pi.outputPath)
+}
+
+// SendBankItemsBatch sends all pending bank items as a batch
+func (pi *PlayerInventory) SendBankItemsBatch(tabName string) {
+	pi.eventMutex.Lock()
+	defer pi.eventMutex.Unlock()
+
+	// Check if there are any pending bank events
+	bankEvents := make([]WebhookEvent, 0)
 	for _, event := range pi.pendingEvents {
-		if event.SlotID >= 1000000 { // Equipment items typically have slot IDs over 1,000,000
-			hasEquipmentItems = true
-			if event.Equipped {
-				equippedItems++
-			}
+		if event.IsBank {
+			bankEvents = append(bankEvents, event)
 		}
 	}
 	
-	if hasEquipmentItems {
-		fmt.Printf("[WEBHOOK BANK BATCH] Batch includes %d equipment items (%d equipped, slots > 1,000,000)\n", 
-			countEquipmentItems(pi.pendingEvents), equippedItems)
-		log.Infof("[WEBHOOK BANK BATCH] Batch includes %d equipment items (%d equipped)", 
-			countEquipmentItems(pi.pendingEvents), equippedItems)
-	} else {
-		fmt.Printf("[WEBHOOK BANK BATCH] Batch contains only inventory items (no equipment)\n")
-		log.Infof("[WEBHOOK BANK BATCH] Batch contains only inventory items (no equipment)")
+	if len(bankEvents) == 0 {
+		log.Infof("[BANK-OVERRIDE] No pending events to send")
+		// Reset bank state even if there are no events
+		pi.isBank = false
+		pi.bankBatchTimer = nil
+		return
 	}
 
-	// For bank items, we always set override=true
-	// This ensures that bank tab content operations always override previous data
+	log.Infof("[BANK-OVERRIDE] Attempting to send batch: Tab=%s, LocationID=%s, Events=%d", 
+		tabName, pi.currentBankLocation, len(bankEvents))
+	
+	// Determine if we should set override flag (always true for bank batches)
 	override := true
-	fmt.Printf("[WEBHOOK BANK BATCH] Override=true: Bank items always override previous data\n")
-	log.Infof("[WEBHOOK BANK BATCH] Override=true: Bank items always override previous data")
+	
+	log.Infof("[BANK-OVERRIDE] Batch details: Override=%v, Bank=true, LocationID=%s", 
+		override, pi.currentBankLocation)
+	
+	log.Infof("[BANK-OVERRIDE] Sending batch with events from various location IDs")
 
 	payload := WebhookPayload{
-		Events:         pi.pendingEvents,
+		Events:         bankEvents,
 		CharacterID:    pi.CharacterID,
 		CharacterName:  pi.CharacterName,
 		BatchTimestamp: time.Now().Unix(),
-		Override:       override, // Always true for bank items
+		Override:       override,
 		Bank:           true,
 	}
 
-	// Set the location ID for all events in the batch
-	fmt.Printf("[WEBHOOK BANK BATCH] Setting location ID to %s for all events in batch\n", locationID)
-	log.Infof("[WEBHOOK BANK BATCH] Setting location ID to %s for all events in batch", locationID)
-	
-	// Update the location ID in each event to match the current bank tab
-	for i := range pi.pendingEvents {
-		pi.pendingEvents[i].LocationID = locationID
-	}
-
-	// Don't print the full payload to reduce log verbosity
-	fmt.Printf("[WEBHOOK PAYLOAD] Bank items batch payload contains %d events (not shown to reduce verbosity)\n", len(pi.pendingEvents))
-	log.Debugf("[WEBHOOK PAYLOAD] Bank items batch payload contains %d events", len(pi.pendingEvents))
-
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
-		log.Errorf("Failed to marshal batched webhook payload: %v", err)
-		fmt.Printf("[WEBHOOK ERROR] Failed to marshal batched webhook payload: %v\n", err)
-		fmt.Printf("[WEBHOOK BANK BATCH] ===== END BANK ITEMS BATCH (FAILED) =====\n\n")
-		
-		// Increment retry counter and check if we should keep retrying
-		pi.webhookRetryCount++
-		if pi.webhookRetryCount > 3 {
-			log.Warnf("[WEBHOOK RETRY] Exceeded maximum retry count (%d), clearing %d pending events", 
-				pi.webhookRetryCount, len(pi.pendingEvents))
-			fmt.Printf("[WEBHOOK RETRY] Exceeded maximum retry count (%d), clearing %d pending events\n", 
-				pi.webhookRetryCount, len(pi.pendingEvents))
-			pi.pendingEvents = nil
-			pi.webhookRetryCount = 0
-		} else {
-			// Log that we're keeping the events in the queue for retry
-			log.Infof("[WEBHOOK RETRY] Keeping %d events in queue for retry after timeout error (attempt %d/3)", 
-				len(pi.pendingEvents), pi.webhookRetryCount)
-			fmt.Printf("[WEBHOOK RETRY] Keeping %d events in queue for retry after timeout error (attempt %d/3)\n", 
-				len(pi.pendingEvents), pi.webhookRetryCount)
-		}
-		
+		log.Errorf("[BANK-OVERRIDE] Failed to marshal webhook payload: %v", err)
 		return
 	}
-
-	fmt.Printf("[WEBHOOK REQUEST] Sending POST request to: %s\n", pi.webhookURL)
-	log.Infof("[WEBHOOK REQUEST] Sending POST request to: %s with %d bytes", pi.webhookURL, len(jsonPayload))
 	
-	// Create a custom HTTP client with timeout
+	// Create a new HTTP client with a timeout
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 	
-	// Create the request
+	// Create a new request
 	req, err := http.NewRequest("POST", pi.webhookURL, bytes.NewBuffer(jsonPayload))
 	if err != nil {
-		log.Errorf("Failed to create request for bank items batch: %v", err)
-		fmt.Printf("[WEBHOOK ERROR] Failed to create request for bank items batch: %v\n", err)
-		fmt.Printf("[WEBHOOK BANK BATCH] ===== END BANK ITEMS BATCH (FAILED) =====\n\n")
+		log.Errorf("[BANK-OVERRIDE] Failed to create webhook request: %v", err)
 		return
 	}
 	
-	// Set headers
+	// Set the content type header
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "AlbionData-Client")
+	
+	// Add a timestamp header for debugging
+	req.Header.Set("X-Albion-Inventory-Timestamp", fmt.Sprintf("%d", time.Now().Unix()))
+	
+	// Add a batch ID header for tracking
+	batchID := fmt.Sprintf("bank-%d-%d", time.Now().Unix(), len(bankEvents))
+	req.Header.Set("X-Albion-Inventory-Batch-ID", batchID)
+	
+	// Record the start time for timing
+	startTime := time.Now()
 	
 	// Send the request
-	startTime := time.Now()
+	log.Infof("[BANK-OVERRIDE] Sending webhook request to %s", pi.webhookURL)
+	
 	resp, err := client.Do(req)
 	requestDuration := time.Since(startTime)
 	
 	if err != nil {
-		log.Errorf("Failed to send batched webhook: %v", err)
-		fmt.Printf("[WEBHOOK ERROR] Failed to send batched webhook: %v\n", err)
-		fmt.Printf("[WEBHOOK BANK BATCH] ===== END BANK ITEMS BATCH (FAILED) =====\n\n")
-		
-		// Increment retry counter and check if we should keep retrying
-		pi.webhookRetryCount++
-		if pi.webhookRetryCount > 3 {
-			log.Warnf("[WEBHOOK RETRY] Exceeded maximum retry count (%d), clearing %d pending events", 
-				pi.webhookRetryCount, len(pi.pendingEvents))
-			fmt.Printf("[WEBHOOK RETRY] Exceeded maximum retry count (%d), clearing %d pending events\n", 
-				pi.webhookRetryCount, len(pi.pendingEvents))
-			pi.pendingEvents = nil
-			pi.webhookRetryCount = 0
-		} else {
-			// Log that we're keeping the events in the queue for retry
-			log.Infof("[WEBHOOK RETRY] Keeping %d events in queue for retry after timeout error (attempt %d/3)", 
-				len(pi.pendingEvents), pi.webhookRetryCount)
-			fmt.Printf("[WEBHOOK RETRY] Keeping %d events in queue for retry after timeout error (attempt %d/3)\n", 
-				len(pi.pendingEvents), pi.webhookRetryCount)
-		}
-		
+		log.Errorf("[BANK-OVERRIDE] Failed to send webhook: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	// Read and print the response body
-	respBody, err := io.ReadAll(resp.Body)
+	// Read the response body
+	_, err = io.ReadAll(resp.Body)
 	if err != nil {
-		log.Errorf("Failed to read response body: %v", err)
-		fmt.Printf("[WEBHOOK ERROR] Failed to read response body: %v\n", err)
+		log.Errorf("[BANK-OVERRIDE] Failed to read response body: %v", err)
 	}
 	
 	// Log request timing
-	fmt.Printf("[WEBHOOK TIMING] Request completed in %v\n", requestDuration)
-	log.Infof("[WEBHOOK TIMING] Request completed in %v", requestDuration)
+	log.Infof("[BANK-OVERRIDE] Request completed in %v", requestDuration)
 	
 	// Check response status
 	if resp.StatusCode >= 400 {
-		log.Errorf("Batched webhook returned error status: %d", resp.StatusCode)
-		fmt.Printf("[WEBHOOK ERROR] Batched webhook returned error status: %d\n", resp.StatusCode)
-		fmt.Printf("[WEBHOOK RESPONSE] Error response body: %s\n", string(respBody))
-		log.Errorf("[WEBHOOK RESPONSE] Error response body: %s", string(respBody))
-		fmt.Printf("[WEBHOOK BANK BATCH] ===== END BANK ITEMS BATCH (FAILED) =====\n\n")
+		log.Errorf("[BANK-OVERRIDE] Webhook returned error status: %d", resp.StatusCode)
 	} else {
-		fmt.Printf("[WEBHOOK SUCCESS] Successfully sent batch of %d bank items\n", len(pi.pendingEvents))
-		fmt.Printf("[WEBHOOK RESPONSE] Response status: %d\n", resp.StatusCode)
-		// Don't print the full response body to reduce log verbosity
-		fmt.Printf("[WEBHOOK RESPONSE] Response received (not shown to reduce verbosity)\n")
-		log.Infof("[WEBHOOK SUCCESS] Successfully sent batch of %d bank items", len(pi.pendingEvents))
-		log.Debugf("[WEBHOOK RESPONSE] Response status: %d, body: %s", resp.StatusCode, string(respBody))
-		fmt.Printf("[WEBHOOK BANK BATCH] ===== END BANK ITEMS BATCH (SUCCESS) =====\n\n")
+		log.Infof("[BANK-OVERRIDE] Webhook request successful: status %d", resp.StatusCode)
+		
+		// Remove bank events after successful send
+		pi.removeBankEvents()
+		
+		log.Infof("[BANK-OVERRIDE] Queue cleared: Bank inventory queue (batch sent successfully)")
 	}
-
-	// Clear pending events after send
-	pi.pendingEvents = nil
-	log.Infof("[WEBHOOK BANK BATCH] Cleared pending events queue after sending batch")
-
-	// Reset retry counter on success
-	pi.webhookRetryCount = 0
 	
-	// If we just sent a batch with locationId = "5", log it
-	if locationID == "5" {
-		log.Infof("[WEBHOOK BANK BATCH] Sent batch with locationId = 5, should reset location ID")
-		fmt.Printf("[WEBHOOK BANK BATCH] Sent batch with locationId = 5, should reset location ID\n")
+	// Reset bank state
+	pi.isBank = false
+	pi.bankBatchTimer = nil
+	
+	log.Infof("[BANK-OVERRIDE] Bank state reset after sending batch")
+	
+	// Check if we need to reset the location ID
+	if pi.currentBankLocation == "5" {
+		log.Infof("[BANK-OVERRIDE] Sent batch with locationId=5, should reset location ID")
 	}
 }
 
+// removeBankEvents removes all bank events from the pending events queue
+func (pi *PlayerInventory) removeBankEvents() {
+	nonBankEvents := make([]WebhookEvent, 0)
+	for _, event := range pi.pendingEvents {
+		if !event.IsBank {
+			nonBankEvents = append(nonBankEvents, event)
+		}
+	}
+	pi.pendingEvents = nonBankEvents
+}
+
 // SetBankBatchTimer sets a timer to send the bank batch after the specified duration
-// This should ONLY be called from operationAssetOverviewTabContent.Process
-// IMPORTANT: Bank batches are ONLY triggered by tab content operations, not by bank vault access notifications
-func (pi *PlayerInventory) SetBankBatchTimer(duration time.Duration, tabName string, locationID string) {
+func (pi *PlayerInventory) SetBankBatchTimer(duration time.Duration, tabName string) {
 	pi.eventMutex.Lock()
 	defer pi.eventMutex.Unlock()
-	
-	// Validate that this is a bank operation with a valid location ID
-	if !isValidTabContentLocationID(locationID) {
-		log.Warnf("[BANK BATCH TIMER] Attempted to set bank batch timer with invalid location ID: %s", locationID)
-		fmt.Printf("[BANK BATCH TIMER] Attempted to set bank batch timer with invalid location ID: %s\n", locationID)
-		return
+
+	// Cancel any existing timer
+	if pi.bankBatchTimer != nil {
+		pi.bankBatchTimer.Stop()
 	}
-	
-	// Stop any existing timer
-	if pi.batchTimer != nil {
-		pi.batchTimer.Stop()
-	}
-	
-	// Create a new timer that will send the bank batch after the specified duration
-	pi.batchTimer = time.AfterFunc(duration, func() {
-		fmt.Printf("\n[BANK BATCH TIMER] Timer expired after %v, sending bank items batch\n", duration)
-		log.Infof("[BANK BATCH TIMER] Timer expired after %v, sending bank items batch", duration)
-		pi.SendBankItemsBatch(tabName, locationID)
-		
-		// If we just sent a batch with locationId = "5", notify the caller to reset the location ID
-		if locationID == "5" {
-			log.Infof("[BANK BATCH TIMER] Sent batch with locationId = 5, should reset location ID")
-			fmt.Printf("[BANK BATCH TIMER] Sent batch with locationId = 5, should reset location ID\n")
-		}
+
+	log.Infof("[BANK-OVERRIDE] Bank batch timer set: %v for location ID %s", duration, pi.currentBankLocation)
+
+	// Set a new timer
+	pi.bankBatchTimer = time.AfterFunc(duration, func() {
+		log.Infof("[BANK-OVERRIDE] Bank batch timer expired after %v, sending bank items batch", duration)
+		pi.SendBankItemsBatch(tabName)
 	})
-	
-	fmt.Printf("[BANK BATCH TIMER] Set timer to send bank items batch after %v for location ID %s\n", duration, locationID)
-	log.Infof("[BANK BATCH TIMER] Set timer to send bank items batch after %v for location ID %s", duration, locationID)
 }
 
 // isValidTabContentLocationID checks if a locationID is a valid tab content ID (1-5)
 func isValidTabContentLocationID(locationID string) bool {
 	return locationID == "1" || locationID == "2" || locationID == "3" || locationID == "4" || locationID == "5"
+}
+
+// AddOrUpdateItem adds or updates an item in the inventory
+func (pi *PlayerInventory) AddOrUpdateItem(itemID int, quantity int, slotID int) {
+	// Call the new method with default values for bank information
+	pi.AddOrUpdateItemWithBank(itemID, quantity, slotID, false, "")
+}
+
+// RemoveItem removes an item from the inventory
+func (pi *PlayerInventory) RemoveItem(itemID int) {
+	// Call the new method with default values for bank information
+	pi.RemoveItemWithBank(itemID, false, "")
+}
+
+// RemoveItemWithBank removes an item from the inventory with bank information
+func (pi *PlayerInventory) RemoveItemWithBank(itemID int, isBank bool, locationID string) {
+	pi.mutex.Lock()
+	defer pi.mutex.Unlock()
+
+	var oldQuantity int
+	var slotID int
+	if item, exists := pi.Items[itemID]; exists {
+		oldQuantity = item.Quantity
+		slotID = item.SlotID
+		
+		// Queue webhook update
+		if pi.webhookURL != "" {
+			pi.queueWebhookEventWithBank("Removed", itemID, 0, oldQuantity, slotID, isBank, locationID)
+		}
+	}
+
+	delete(pi.Items, itemID)
+	pi.LastUpdated = time.Now().Unix()
+	
+	// Only save to file if an output path is provided
+	if pi.outputPath != "" {
+		pi.SaveToFile()
+	}
+}
+
+// AddOrUpdateItemWithBank adds or updates an item in the inventory with bank information
+func (pi *PlayerInventory) AddOrUpdateItemWithBank(itemID int, quantity int, slotID int, isBank bool, locationID string) {
+	pi.mutex.Lock()
+	defer pi.mutex.Unlock()
+
+	now := time.Now().Unix()
+	var action string
+	var oldQuantity int
+	
+	// Handle negative quantities (likely due to byte overflow in the game client)
+	originalQuantity := quantity
+	if quantity < 0 {
+		if quantity >= -127 {
+			// For values between -1 and -127, add 256 to get the actual quantity
+			// This is similar to how the auction code handles negative item amounts
+			quantity = 256 + quantity
+			log.Debugf("[INVENTORY] Converting negative quantity %d to %d for item %d", 
+				originalQuantity, quantity, itemID)
+		} else {
+			// For very negative values, we're not sure how to interpret them
+			// Log a warning but keep the original value
+			log.Warnf("[INVENTORY] Received very negative quantity %d for item %d", 
+				quantity, itemID)
+		}
+	}
+
+	if item, exists := pi.Items[itemID]; exists {
+		oldQuantity = item.Quantity
+		action = "Updated"
+		item.Quantity = quantity
+		item.SlotID = slotID
+		item.LastSeen = now
+	} else {
+		oldQuantity = 0
+		action = "Added"
+		pi.Items[itemID] = &InventoryItem{
+			ItemID:   itemID,
+			Quantity: quantity,
+			SlotID:   slotID,
+			LastSeen: now,
+		}
+	}
+
+	pi.LastUpdated = now
+	
+	// Queue webhook update
+	if pi.webhookURL != "" {
+		pi.queueWebhookEventWithBank(action, itemID, quantity, oldQuantity, slotID, isBank, locationID)
+	}
+	
+	// Only save to file if an output path is provided
+	if pi.outputPath != "" {
+		pi.SaveToFile()
+	}
+}
+
+// AddOrUpdateEquipmentItem adds or updates an equipment item in the inventory
+func (pi *PlayerInventory) AddOrUpdateEquipmentItem(itemID int, quantity int, slotID int, equipped bool, isBank bool, locationID string) {
+	pi.mutex.Lock()
+	defer pi.mutex.Unlock()
+
+	now := time.Now().Unix()
+	var action string
+	var oldQuantity int
+	
+	// Handle negative quantities (likely due to byte overflow in the game client)
+	originalQuantity := quantity
+	if quantity < 0 {
+		if quantity >= -127 {
+			// For values between -1 and -127, add 256 to get the actual quantity
+			// This is similar to how the auction code handles negative item amounts
+			quantity = 256 + quantity
+			log.Debugf("[INVENTORY] Converting negative quantity %d to %d for item %d", 
+				originalQuantity, quantity, itemID)
+		} else {
+			// For very negative values, we're not sure how to interpret them
+			// Log a warning but keep the original value
+			log.Warnf("[INVENTORY] Received very negative quantity %d for item %d", 
+				quantity, itemID)
+		}
+	}
+
+	if item, exists := pi.Items[itemID]; exists {
+		oldQuantity = item.Quantity
+		action = "Updated"
+		item.Quantity = quantity
+		item.SlotID = slotID
+		item.LastSeen = now
+	} else {
+		oldQuantity = 0
+		action = "Added"
+		pi.Items[itemID] = &InventoryItem{
+			ItemID:   itemID,
+			Quantity: quantity,
+			SlotID:   slotID,
+			LastSeen: now,
+		}
+	}
+
+	pi.LastUpdated = now
+	
+	// Queue webhook update with equipped information
+	if pi.webhookURL != "" {
+		pi.queueWebhookEventWithEquipped(action, itemID, quantity, oldQuantity, slotID, equipped, isBank, locationID)
+	}
+	
+	// Only save to file if an output path is provided
+	if pi.outputPath != "" {
+		pi.SaveToFile()
+	}
 } 

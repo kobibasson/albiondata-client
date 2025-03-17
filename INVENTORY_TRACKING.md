@@ -25,6 +25,27 @@ This will show debug information for the following events:
 - `evInventoryPutItem` (26): When items are added to your inventory
 - `evInventoryDeleteItem` (27): When items are removed from your inventory
 
+## Logging System
+
+The inventory tracking feature uses a clear, consistent logging system that explains what's happening with the queues and webhooks. All logs are prefixed with `[INVENTORY]` for easy filtering. The logging system provides information about:
+
+- Queue opening and closing events
+- Why queues are opened or closed
+- What information is being sent
+- HTTP response status codes
+- Retry attempts for failed webhook requests
+
+Example log messages:
+
+```
+[INVENTORY] Queue opened: Player inventory sync queue (cluster change trigger)
+[INVENTORY] Adding to default queue: Item=123, Action=Added, Quantity=10, Delta=10
+[INVENTORY] Setting batch timer: 10s (normal operation)
+[INVENTORY] Sending webhook request to http://localhost:3000/api/inventory/webhook
+[INVENTORY] Webhook request successful: status 200
+[INVENTORY] Queue cleared: Default inventory queue (batch sent successfully)
+```
+
 ## How It Works
 
 The inventory tracking feature works by monitoring game events and operations, then sending webhook updates with inventory changes. There are three main tracking mechanisms, each with different behavior:
@@ -40,10 +61,11 @@ When the player opens a bank vault tab, this operation is detected and triggers 
   - Location IDs increment each time a new tab is viewed (1→2→3→4→5→1)
   - IDs reset to 1 after reaching 5 or after 10 seconds of inactivity
 - Collects all `evNewSimpleItem` and `evNewEquipmentItem` events that occur while the queue is open
+- Each event is tagged with the location ID that was active when the event was added to the queue
 - Sends a webhook payload with:
   - `override: true` - indicating this data should replace previous bank inventory data
   - `bank: true` - indicating these are bank items
-  - `location_id` - the assigned bank tab index (1-5)
+  - Each event retains its original `location_id` (1-5) from when it was added to the queue
 
 The bank queue closes after 10 seconds of inactivity or immediately if it's been more than 10 seconds since the last tab content event. The queue will only reopen when another `opAssetOverviewTabContent` operation is detected.
 
@@ -120,6 +142,15 @@ For inventory changes that occur outside of bank access or cluster changes:
       "action": "Added",
       "timestamp": 1709971612,
       "location_id": "3"
+    },
+    {
+      "item_id": 910,
+      "quantity": 50,
+      "slot_id": 1,
+      "delta": 50,
+      "action": "Added",
+      "timestamp": 1709971615,
+      "location_id": "4"
     }
   ],
   "character_id": "your-character-uuid",
@@ -129,6 +160,8 @@ For inventory changes that occur outside of bank access or cluster changes:
   "bank": true
 }
 ```
+
+Note that in the bank inventory example, events can have different location IDs within the same batch, as each event retains the location ID from when it was added to the queue.
 
 ## Payload Fields Explained
 
@@ -170,9 +203,47 @@ If you're not receiving inventory updates:
 
 1. Make sure you're running the Albion Data Client with the `-inventory-webhook` flag
 2. Verify that your webhook server is running and accessible
-3. Look for webhook error messages in the Albion Data Client console
+3. Look for webhook error messages in the Albion Data Client logs (prefixed with `[INVENTORY]`)
 4. Make sure your webhook server is properly handling the POST requests
 
 If you encounter a "flag redefined" error when running the application, it means there's a conflict in the command-line flags. This has been fixed in the latest version, but if you're still experiencing this issue, please report it on the GitHub repository.
 
-If you're still having issues, please report them on the GitHub repository. 
+If you're still having issues, please report them on the GitHub repository.
+
+## Technical Implementation Notes
+
+The following technical details document recent fixes and implementation specifics that may be helpful for troubleshooting or future development:
+
+### Bank Location ID Handling
+
+1. **Location ID Preservation**: Each bank event is tagged with the location ID (1-5) that was active when the event was added to the queue. Events retain their original location ID even when multiple bank tabs are accessed in sequence.
+
+2. **Location ID Reset**: The location ID counter (`LastTabContentLocationID`) cycles from 1 to 5 and resets to 0 after reaching 5. This reset ensures the next tab content operation starts with location ID 1.
+
+3. **Bank State Reset**: After sending a bank batch, the bank state (`isBank` flag and `bankBatchTimer`) is properly reset to prevent sending additional bank batches without a new trigger event.
+
+### Timer Initialization
+
+1. **Initial Time Values**: All time-related fields (`lastClusterChange`, `lastJoinTime`, `lastLeaveTime`, `lastBankAccess`, `lastEventTime`) are initialized to 30 minutes in the past rather than the current time. This prevents the system from incorrectly using short timers (2s) on startup, ensuring it begins with the normal 10-second timer for batching events.
+
+2. **Batch Timer Retry**: If a batch send is skipped due to being too close to a cluster change (within 4 seconds), the timer is reset to try again in 2 seconds, ensuring events aren't lost.
+
+### Queue Management
+
+1. **Bank Queue Behavior**: Bank queues are only triggered by `opAssetOverviewTabContent` operations, not by bank vault access notifications. The `NotifyBankVaultAccess` method only updates state and does not trigger queues.
+
+2. **Auto-Reset Logic**: If it's been more than 3 seconds since the last bank access and the bank state is still active, the system automatically resets the bank state before sending a batch.
+
+3. **Timer Management**: After a bank batch is sent via timer, a new timer is set up for any pending default events to ensure they aren't lost.
+
+### Deviations from Documentation
+
+The implementation includes some technical details that differ slightly from the documentation:
+
+1. **Bank State Reset**: The documentation states that "The bank queue closes after 10 seconds of inactivity," but the implementation also explicitly resets the bank state after sending a batch, regardless of inactivity time.
+
+2. **Location ID Handling**: While the documentation mentions that location IDs cycle from 1-5, the implementation specifically resets to 0 (which becomes 1 on the next event) after reaching 5 or after sending a batch with locationId=5.
+
+3. **Timer Behavior**: The implementation includes additional logic for retrying batch sends that are skipped due to being too close to cluster changes, which isn't explicitly mentioned in the documentation.
+
+These implementation details ensure more reliable tracking of inventory changes, particularly when switching between bank tabs or during cluster changes. 
