@@ -31,6 +31,10 @@ type albionState struct {
 	LastLeaveTime        int64 // Timestamp of the last leave event
 	LastBankVaultLocationID string // ID of the last bank vault accessed
 	LastBankVaultTime    int64 // Timestamp of the last bank vault access
+	BankTabs             map[string]string // Map of bank tab IDs to names
+	CurrentBankTabID     string // Current bank tab being viewed
+	LastTabContentLocationID int // Last location ID used for tab content
+	LastTabContentTime   int64 // Timestamp of the last tab content operation
 
 	// A lot of information is sent out but not contained in the response when requesting marketHistory (e.g. ID)
 	// This information is stored in marketHistoryInfo

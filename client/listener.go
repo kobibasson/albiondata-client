@@ -231,9 +231,16 @@ func (l *listener) onReliableCommand(command *photon.PhotonCommand) {
 		operation, err = decodeRequest(params)
 		if params[253] != nil {
 			number := params[253].(int16)
-			shouldDebug, exists := ConfigGlobal.DebugOperations[int(number)]
-			if (exists && shouldDebug) || (!exists && ConfigGlobal.DebugOperationsString == "") {
-				log.Debugf("OperationRequest: [%v]%v - %v", number, OperationType(number), params)
+			opType := OperationType(number)
+			
+			// Always log asset overview tab content operations regardless of debug settings
+			if opType == opAssetOverviewTabContent {
+				log.Infof("OperationRequest: [%v]%v - %v", number, opType, params)
+			} else {
+				shouldDebug, exists := ConfigGlobal.DebugOperations[int(number)]
+				if (exists && shouldDebug) || (!exists && ConfigGlobal.DebugOperationsString == "") {
+					log.Debugf("OperationRequest: [%v]%v - %v", number, opType, params)
+				}
 			}
 		} else if !ConfigGlobal.DebugIgnoreDecodingErrors {
 			log.Debugf("OperationRequest: ERROR - %v", params)
@@ -242,9 +249,16 @@ func (l *listener) onReliableCommand(command *photon.PhotonCommand) {
 		operation, err = decodeResponse(params)
 		if params[253] != nil {
 			number := params[253].(int16)
-			shouldDebug, exists := ConfigGlobal.DebugOperations[int(number)]
-			if (exists && shouldDebug) || (!exists && ConfigGlobal.DebugOperationsString == "") {
-				log.Debugf("OperationResponse: [%v]%v - %v", number, OperationType(number), params)
+			opType := OperationType(number)
+			
+			// Always log asset overview tab content operations regardless of debug settings
+			if opType == opAssetOverviewTabContent {
+				log.Infof("OperationResponse: [%v]%v - %v", number, opType, params)
+			} else {
+				shouldDebug, exists := ConfigGlobal.DebugOperations[int(number)]
+				if (exists && shouldDebug) || (!exists && ConfigGlobal.DebugOperationsString == "") {
+					log.Debugf("OperationResponse: [%v]%v - %v", number, opType, params)
+				}
 			}
 		} else if !ConfigGlobal.DebugIgnoreDecodingErrors {
 			log.Debugf("OperationResponse: ERROR - %v", params)
@@ -253,9 +267,12 @@ func (l *listener) onReliableCommand(command *photon.PhotonCommand) {
 		operation, err = decodeEvent(params)
 		if params[252] != nil {
 			number := params[252].(int16)
+			evType := EventType(number)
+			
+			// No longer special handling for bank vault events
 			shouldDebug, exists := ConfigGlobal.DebugEvents[int(number)]
 			if (exists && shouldDebug) || (!exists && ConfigGlobal.DebugEventsString == "") {
-				log.Debugf("EventDataType: [%v]%v - %v", number, EventType(number), params)
+				log.Debugf("EventDataType: [%v]%v - %v", number, evType, params)
 			}
 		} else if !ConfigGlobal.DebugIgnoreDecodingErrors {
 			log.Debugf("EventDataType: ERROR - %v", params)

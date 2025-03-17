@@ -77,6 +77,11 @@ func decodeResponse(params map[uint8]interface{}) (operation operation, err erro
 		operation = &operationRealEstateGetAuctionDataResponse{}
 	case opRealEstateBidOnAuction:
 		operation = &operationRealEstateBidOnAuctionResponse{}
+	// Temporarily disabled to avoid duplicate webhook calls
+	// case opAssetOverviewTabs:
+	// 	operation = &operationAssetOverviewTabs{}
+	case opAssetOverviewTabContent:
+		operation = &operationAssetOverviewTabContent{}
 	default:
 		return nil, nil
 	}
@@ -104,6 +109,7 @@ func decodeEvent(params map[uint8]interface{}) (event operation, err error) {
 		event = &eventNewSimpleItem{}
 	case evNewEquipmentItem:
 		event = &eventNewEquipmentItem{}
+	// Bank vault events are now processed again to track timing for evNewSimpleItem filtering
 	case evBankVaultInfo:
 		event = &eventBankVaultInfo{}
 	default:
