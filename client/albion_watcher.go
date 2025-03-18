@@ -46,10 +46,24 @@ func (apw *albionProcessWatcher) run() error {
 		if ConfigGlobal.InventoryWebhookURL != "" {
 			fmt.Printf("WEBHOOK ENABLED: Sending updates to %s\n", ConfigGlobal.InventoryWebhookURL)
 			fmt.Println("Webhook debug information will be displayed in real-time")
+			
+			// Log if auth header is provided (without showing the actual value)
+			if ConfigGlobal.InventoryWebhookAuthHeader != "" {
+				authValue := ConfigGlobal.InventoryWebhookAuthHeader
+				if len(authValue) > 10 {
+					// Show first 5 and last 3 characters of the auth value
+					authValue = authValue[:5] + "..." + authValue[len(authValue)-3:]
+				}
+				fmt.Printf("Authorization header will be added to webhook requests: %s\n", authValue)
+			}
 		}
 		
 		fmt.Println("=================================================")
-		apw.r.albionstate.Inventory = NewPlayerInventory(ConfigGlobal.InventoryOutputPath, ConfigGlobal.InventoryWebhookURL)
+		apw.r.albionstate.Inventory = NewPlayerInventory(
+			ConfigGlobal.InventoryOutputPath, 
+			ConfigGlobal.InventoryWebhookURL,
+			ConfigGlobal.InventoryWebhookAuthHeader,
+		)
 	}
 	
 	go apw.r.run()

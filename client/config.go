@@ -40,6 +40,7 @@ type config struct {
 	PrintVersion                   bool
 	InventoryOutputPath            string
 	InventoryWebhookURL            string
+	InventoryWebhookAuthHeader     string
 }
 
 // config global config data
@@ -223,6 +224,13 @@ func (config *config) setupCommonFlags() {
 		"inventory-webhook",
 		"",
 		"URL to send inventory updates to (e.g., http://localhost:3000/api/inventory/webhook).",
+	)
+
+	flag.StringVar(
+		&config.InventoryWebhookAuthHeader,
+		"inventory-webhook-auth",
+		"",
+		"Authorization header value for inventory webhook requests.",
 	)
 }
 

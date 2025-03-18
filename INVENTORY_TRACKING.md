@@ -12,9 +12,15 @@ You can send inventory updates to a webhook endpoint by using the `-inventory-we
 albiondata-client.exe -inventory-webhook "http://localhost:3000/api/inventory/webhook"
 ```
 
+To secure your webhook endpoint, you can add an authorization header with the `-inventory-webhook-auth` flag:
+
+```
+albiondata-client.exe -inventory-webhook "http://localhost:3000/api/inventory/webhook" -inventory-webhook-auth "Bearer your-token-here"
+```
+
 ### Debug Information
 
-You can combine this flag with debug flags to see more information:
+You can combine these flags with debug flags to see more information:
 
 ```
 albiondata-client.exe -debug -events 32,26,27 -inventory-webhook "http://localhost:3000/api/inventory/webhook"
@@ -205,6 +211,9 @@ If you're not receiving inventory updates:
 2. Verify that your webhook server is running and accessible
 3. Look for webhook error messages in the Albion Data Client logs (prefixed with `[INVENTORY]`)
 4. Make sure your webhook server is properly handling the POST requests
+5. If you're using authentication, ensure the `-inventory-webhook-auth` flag contains the correct authorization value expected by your server
+   - The client will display a masked version of your authorization header at startup and in logs before each request for verification
+   - Look for messages like `Adding Authorization header: Beare...123` in the logs
 
 If you encounter a "flag redefined" error when running the application, it means there's a conflict in the command-line flags. This has been fixed in the latest version, but if you're still experiencing this issue, please report it on the GitHub repository.
 
@@ -213,6 +222,15 @@ If you're still having issues, please report them on the GitHub repository.
 ## Technical Implementation Notes
 
 The following technical details document recent fixes and implementation specifics that may be helpful for troubleshooting or future development:
+
+### Authentication Header Support
+
+All webhook requests can include an Authorization header for improved security. To use this feature:
+
+1. Use the `-inventory-webhook-auth` flag when starting the client
+2. The value provided will be added as an `Authorization` header to all webhook requests
+3. Common formats include `Bearer your-token-here` or `Basic base64-encoded-credentials`
+4. The authorization header is applied to all types of webhook requests (bank updates, inventory sync, and individual updates)
 
 ### Bank Location ID Handling
 

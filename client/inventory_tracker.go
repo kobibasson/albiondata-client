@@ -81,6 +81,8 @@ type PlayerInventory struct {
 	verboseOutput bool
 	// Webhook URL to send inventory updates
 	webhookURL    string
+	// Webhook Authorization header value
+	webhookAuthHeader string
 	// Queue for pending webhook events
 	pendingEvents []WebhookEvent
 	// Timer for sending batched events
@@ -108,7 +110,7 @@ type PlayerInventory struct {
 }
 
 // NewPlayerInventory creates a new player inventory tracker
-func NewPlayerInventory(outputPath string, webhookURL string) *PlayerInventory {
+func NewPlayerInventory(outputPath string, webhookURL string, webhookAuthHeader string) *PlayerInventory {
 	// Set initial time to be well in the past (30 minutes ago)
 	// This ensures we don't start with short timers thinking we're close to a cluster change
 	initialTime := time.Now().Add(-30 * time.Minute)
@@ -118,6 +120,7 @@ func NewPlayerInventory(outputPath string, webhookURL string) *PlayerInventory {
 		outputPath:     outputPath,
 		verboseOutput:  true, // Enable verbose output by default when inventory tracking is enabled
 		webhookURL:     webhookURL,
+		webhookAuthHeader: webhookAuthHeader,
 		pendingEvents:  make([]WebhookEvent, 0),
 		webhookRetryCount: 0, // Initialize retry counter
 		lastClusterChange: initialTime,
@@ -297,6 +300,18 @@ func (pi *PlayerInventory) sendBatchedEvents() {
 	batchID := fmt.Sprintf("%d-%d", time.Now().Unix(), len(nonBankEvents))
 	req.Header.Set("X-Albion-Inventory-Batch-ID", batchID)
 	
+	// Add authorization header if provided
+	if pi.webhookAuthHeader != "" {
+		req.Header.Set("Authorization", pi.webhookAuthHeader)
+		// Log that we're adding the auth header (without showing the full value)
+		authValue := pi.webhookAuthHeader
+		if len(authValue) > 10 {
+			// Show first 5 and last 3 characters of the auth value
+			authValue = authValue[:5] + "..." + authValue[len(authValue)-3:]
+		}
+		log.Infof("%s Adding Authorization header: %s", prefix, authValue)
+	}
+	
 	// Record the start time for timing
 	startTime := time.Now()
 	
@@ -472,6 +487,14 @@ func (pi *PlayerInventory) sendWebhookUpdate(action string, itemID int, quantity
 		locationID = "0"
 	}
 	
+	// Log prefix
+	prefix := "[INVENTORY]"
+	if override {
+		prefix = "[INVENTORY-OVERRIDE]"
+	} else if isBank {
+		prefix = "[BANK-OVERRIDE]"
+	}
+	
 	payload := SingleItemWebhookPayload{
 		ItemID:        itemID,
 		Quantity:      quantity,
@@ -493,8 +516,35 @@ func (pi *PlayerInventory) sendWebhookUpdate(action string, itemID int, quantity
 		return
 	}
 	
-	// Send the payload to the webhook URL
-	resp, err := http.Post(pi.webhookURL, "application/json", bytes.NewBuffer(jsonPayload))
+	// Create a new HTTP client with a timeout
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	
+	// Create a new request
+	req, err := http.NewRequest("POST", pi.webhookURL, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		log.Errorf("[INVENTORY] Failed to create webhook request: %v", err)
+		return
+	}
+	
+	// Set the content type header
+	req.Header.Set("Content-Type", "application/json")
+	
+	// Add authorization header if provided
+	if pi.webhookAuthHeader != "" {
+		req.Header.Set("Authorization", pi.webhookAuthHeader)
+		// Log that we're adding the auth header (without showing the full value)
+		authValue := pi.webhookAuthHeader
+		if len(authValue) > 10 {
+			// Show first 5 and last 3 characters of the auth value
+			authValue = authValue[:5] + "..." + authValue[len(authValue)-3:]
+		}
+		log.Infof("%s Adding Authorization header: %s", prefix, authValue)
+	}
+	
+	// Send the request
+	resp, err := client.Do(req)
 	if err != nil {
 		log.Errorf("[INVENTORY] Failed to send webhook: %v", err)
 		return
@@ -760,6 +810,18 @@ func (pi *PlayerInventory) SendBankItemsBatch(tabName string) {
 	// Add a batch ID header for tracking
 	batchID := fmt.Sprintf("bank-%d-%d", time.Now().Unix(), len(bankEvents))
 	req.Header.Set("X-Albion-Inventory-Batch-ID", batchID)
+	
+	// Add authorization header if provided
+	if pi.webhookAuthHeader != "" {
+		req.Header.Set("Authorization", pi.webhookAuthHeader)
+		// Log that we're adding the auth header (without showing the full value)
+		authValue := pi.webhookAuthHeader
+		if len(authValue) > 10 {
+			// Show first 5 and last 3 characters of the auth value
+			authValue = authValue[:5] + "..." + authValue[len(authValue)-3:]
+		}
+		log.Infof("[BANK-OVERRIDE] Adding Authorization header: %s", authValue)
+	}
 	
 	// Record the start time for timing
 	startTime := time.Now()
